@@ -730,9 +730,8 @@ def phys_bonds(dt: ti.f32):
         Fx = Fn * ux + Fs * px
         Fy = Fn * uy + Fs * py
         # Накопление упругой энергии за подшаг:
-        # E += ½·k·u² · dt  (нормаль + сдвиг + изгиб)
-        dE = (0.5 * kb * strain * strain + 0.5 * ks * off * off + 0.5 * krot * rel * rel) * dt
-        ti.atomic_add(bondE[bd], dE)
+        # E += ½·k·u² · dt  (нормаль + сдвиг + изгиб) ИЗМ
+        bondE[bd] = 0.5 * kb * strain * strain + 0.5 * ks * off * off + 0.5 * krot * rel * rel
         ti.atomic_add(bfx[b], Fx)
         ti.atomic_add(bfy[b], Fy)
         ti.atomic_add(bfx[a], -Fx)
