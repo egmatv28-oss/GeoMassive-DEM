@@ -1,14 +1,33 @@
-"""ГЕОМАССИВ/2D · DEM — графика отображение (render)
+"""ГЕОМАССИВ/2D · DEM — модель, инструменты и графика (render)
 
-Рендер на GPU (Vulkan), GUI на imgui. Подключает решатель solver.py.
+Здесь строится МОДЕЛЬ (генерация сцен, полости, ослабленные плоскости,
+произвольный мозаичный массив), живут инструменты редактирования
+(порода/трещина/ластик), штрих мыши, пыль и вся отрисовка. Модель передаётся
+в физический движок solver.py (примитивами add_block_func/add_bond_func либо
+bulk-загрузкой build_model). Решатель ничего не знает про сцены и GUI.
 Точка входа — mineudec.py:  python mineudec.py [--selftest]
 """
 
 import argparse
 import math
+import random
 import time
 
+import taichi as ti
+
 from solver import *
+
+# =================================================== модель: служебные поля генерации
+# (сетка занятости клеток и пометки разрезов используются только при построении
+# модели на регулярной сетке; в физике их нет)
+cutR = ti.field(ti.i32, N)
+cutD = ti.field(ti.i32, N)
+noisePts = ti.field(ti.f32, 128)
+n1Arr = ti.field(ti.f32, COLS)
+n2Arr = ti.field(ti.f32, COLS)
+hgtArr = ti.field(ti.f32, COLS)
+r_filled = ti.field(ti.i32, N)
+r_block = ti.field(ti.i32, N)
 
 img = ti.Vector.field(3, ti.f32, (W, H))
 
@@ -166,14 +185,16 @@ def render_triangles(t: ti.f32, on: ti.i32):
 @ti.kernel
 def render_blocks():
     for i in range(bcount[None]):
-        X = int((bx[i] - 0.5) * CELL)
-        Y = H - 1 - int((by[i] - 0.5) * CELL)
+        ri = bsz[i] * CELL * 0.5
+        px = int(bsz[i] * CELL)
+        X = int(bx[i] * CELL - ri)
+        Y = H - 1 - int(by[i] * CELL + ri)
         if bfixed[i] == 1:
-            fill_rect(X, Y, X + CELL - 1, Y + CELL - 1, FIXED)
+            fill_rect(X, Y, X + px - 1, Y + px - 1, FIXED)
             diag = FIXED * (1.0 - 0.35) + AMBER * 0.35
-            draw_line(X + 3, Y + 3, X + CELL - 3, Y + CELL - 3, diag, 1.0)
+            draw_line(X + 3, Y + 3, X + px - 3, Y + px - 3, diag, 1.0)
             strip = FIXED * (1.0 - 0.14) + AMBER * 0.14
-            fill_rect(X, Y + CELL - 3, X + CELL - 1, Y + CELL - 1, strip)
+            fill_rect(X, Y + px - 3, X + px - 1, Y + px - 1, strip)
         else:
             s = bshade[i]
             r = 112.0 + s * 26.0
@@ -193,11 +214,11 @@ def render_blocks():
                 b = b + (228.0 - b) * u
             col = ti.Vector([r / 255.0, g / 255.0, b / 255.0])
             if ti.abs(brot[i]) > 0.02:
-                fill_rot_rect(bx[i] * CELL, H - 1 - by[i] * CELL, brot[i], CELL * 0.5, col)
+                fill_rot_rect(bx[i] * CELL, H - 1 - by[i] * CELL, brot[i], ri, col)
             else:
-                fill_rect(X, Y, X + CELL - 1, Y + CELL - 1, col)
+                fill_rect(X, Y, X + px - 1, Y + px - 1, col)
                 hl = col * (1.0 - 0.07) + WHITE * 0.07
-                fill_rect(X, Y + CELL - 2, X + CELL - 1, Y + CELL - 1, hl)
+                fill_rect(X, Y + px - 2, X + px - 1, Y + px - 1, hl)
 
 
 @ti.kernel
@@ -216,29 +237,27 @@ def render_bonds(show: ti.i32):
 
 @ti.kernel
 def render_joints():
-    # серые линии по стыкам соединённых блоков — видно, где массив цельный
+    # швы между связанными блоками (линия по общему ребру, поперёк связи)
     for bd in range(bondCount[None]):
         if bondIntact[bd] == 0:
             continue
         a = bondA[bd]
         b = bondB[bd]
-        # рисуем по фиксированной сетке клеток-домов, а не по смещённым позициям
-        ha = bhome[a]
-        hb = bhome[b]
-        hax = ha % COLS
-        hay = ha // COLS
-        hbx = hb % COLS
-        hby = hb // COLS
-        if bondAxis[bd] == 0:
-            x = (ti.max(hax, hbx) + 1) * CELL
-            y_top = H - 1 - (ti.min(hay, hby) + 1) * CELL
-            y_bot = H - 1 - ti.min(hay, hby) * CELL
-            fill_rect(x, y_top, x, y_bot, JOINT)
-        else:
-            y = H - 1 - (ti.max(hay, hby) + 1) * CELL
-            x1 = ti.min(hax, hbx) * CELL
-            x2 = (ti.min(hax, hbx) + 1) * CELL
-            fill_rect(x1, y, x2, y, JOINT)
+        mx = (bx[a] + bx[b]) * 0.5
+        my = (by[a] + by[b]) * 0.5
+        dx = bx[b] - bx[a]
+        dy = by[b] - by[a]
+        d = ti.sqrt(dx * dx + dy * dy)
+        if d < 1e-6:
+            continue
+        ux = dx / d
+        uy = dy / d
+        w = ti.min(bsz[a], bsz[b]) * 0.5
+        px = -uy * w * CELL
+        py = ux * w * CELL
+        cx0 = mx * CELL
+        cy0 = H - 1 - my * CELL
+        draw_line(cx0 - px, cy0 - py, cx0 + px, cy0 + py, JOINT, 1.0)
 
 
 @ti.kernel
@@ -255,10 +274,11 @@ def render_cracks():
         mx = (bx[a] + bx[b]) * 0.5 * CELL
         my = H - 1 - (by[a] + by[b]) * 0.5 * CELL
         j = bondJ[bd] * CELL
-        if bondAxis[bd] == 0:
-            draw_line(mx + j * 0.4, my - CELL * 0.55, mx - j * 0.4, my + CELL * 0.55, CRACK, 2.0)
+        hl = ti.min(bsz[a], bsz[b]) * CELL * 0.55
+        if ti.abs(dx) >= ti.abs(dy):
+            draw_line(mx + j * 0.4, my - hl, mx - j * 0.4, my + hl, CRACK, 2.0)
         else:
-            draw_line(mx - CELL * 0.55, my + j * 0.4, mx + CELL * 0.55, my - j * 0.4, CRACK, 2.0)
+            draw_line(mx - hl, my + j * 0.4, mx + hl, my - j * 0.4, CRACK, 2.0)
 
 
 @ti.kernel
@@ -309,7 +329,526 @@ def render_mouse(mx: ti.f32, my: ti.f32, brush: ti.f32, is_water: ti.i32):
             draw_circle_outline(X, Y, r, AMBER * 0.7, 1.5)
 
 
+# ================================================================== генерация модели
+@ti.func
+def cut_between(ax: ti.i32, ay: ti.i32, bxx: ti.i32, byy: ti.i32):
+    ok = (ax >= 0 and ay >= 0 and bxx >= 0 and byy >= 0
+          and ax < COLS and ay < ROWS and bxx < COLS and byy < ROWS)
+    if ok:
+        dx = bxx - ax
+        dy = byy - ay
+        if dy == 0 and ti.abs(dx) == 1:
+            cutR[ay * COLS + ti.min(ax, bxx)] = 1
+        elif dx == 0 and ti.abs(dy) == 1:
+            cutD[ti.min(ay, byy) * COLS + ax] = 1
+        elif ti.abs(dx) == 1 and ti.abs(dy) == 1:
+            x0 = ti.min(ax, bxx)
+            y0 = ti.min(ay, byy)
+            cutR[y0 * COLS + x0] = 1
+            cutD[y0 * COLS + x0] = 1
 
+
+@ti.func
+def noise_line(step: ti.f32):
+    m = int(ti.ceil(COLS / step)) + 2
+    i = 0
+    while i < m:
+        noisePts[i] = ti.random()
+        i += 1
+    x = 0
+    while x < COLS:
+        t = x / step
+        i0 = int(t)
+        f = t - i0
+        u = (1.0 - ti.cos(f * PI)) * 0.5
+        hgtArr[x] = noisePts[i0] * (1.0 - u) + noisePts[i0 + 1] * u
+        x += 1
+
+
+@ti.kernel
+def gen_tunnel(weak: ti.i32):
+    for c in range(N):
+        r_filled[c] = 0
+        r_block[c] = -1
+        cutR[c] = 0
+        cutD[c] = 0
+    tx = COLS * 0.5
+    ty = ROWS * 0.6
+    trx = 7.0
+    try_ = 5.0
+    cavX[None] = tx
+    cavY[None] = ty
+    cavRX[None] = trx
+    cavRY[None] = try_
+    y = 0
+    while y < ROWS:
+        x = 0
+        while x < COLS:
+            cell = y * COLS + x
+            fixed = 1
+            if y < ROWS - 2:
+                dx = (x + 0.5 - tx) / trx
+                dy = (y + 0.5 - ty) / try_
+                if dx * dx + dy * dy < 1.0:
+                    x += 1
+                    continue
+                fixed = 1 if y >= ROWS - P[None].fixedRows else 0
+            i = add_block_func(x + 0.5, y + 0.5, 1.0, fixed)
+            if i >= 0:
+                r_filled[cell] = 1
+                r_block[cell] = i
+            x += 1
+        y += 1
+    if weak == 1:
+        b = 0
+        while b < 2:
+            base = 13 if b == 0 else 33
+            ph = ti.random() * 6.0
+            x = 6
+            while x < COLS - 6:
+                yb = base + int(ti.floor(ti.sin(x * 0.22 + ph) * 1.5 + 0.5))
+                if yb > 1 and yb < ROWS - 3:
+                    cutD[yb * COLS + x] = 1
+                x += 1
+            b += 1
+        jn = 0
+        while jn < 3:
+            jx = int(8.0 + ti.random() * (COLS - 16))
+            ang = PI * 0.5 + (ti.random() - 0.5) * 0.5
+            cx2 = jx
+            cy2 = 1
+            fx = jx + 0.5
+            fy = 1.5
+            s = 0
+            while s < 40:
+                fx += ti.cos(ang) * 0.9
+                fy += ti.sin(ang) * 0.9
+                ang += (ti.random() - 0.5) * 0.3
+                nx = int(fx)
+                ny = int(fy)
+                if nx < 1 or nx >= COLS - 1 or ny < 1 or ny >= ROWS - 2:
+                    break
+                if nx != cx2 or ny != cy2:
+                    cut_between(cx2, cy2, nx, ny)
+                    cx2 = nx
+                    cy2 = ny
+                s += 1
+            jn += 1
+    c = 0
+    while c < N:
+        a = r_block[c]
+        if a >= 0:
+            if (c % COLS) < COLS - 1 and r_block[c + 1] >= 0:
+                add_bond_func(a, r_block[c + 1], 1.0, 1 if cutR[c] == 0 else 0)
+            if (c // COLS) < ROWS - 1 and r_block[c + COLS] >= 0:
+                add_bond_func(a, r_block[c + COLS], 1.0, 1 if cutD[c] == 0 else 0)
+        c += 1
+
+
+@ti.kernel
+def gen_slope(weak: ti.i32):
+    for c in range(N):
+        r_filled[c] = 0
+        r_block[c] = -1
+        cutR[c] = 0
+        cutD[c] = 0
+    noise_line(11.0)
+    for x in range(COLS):
+        n1Arr[x] = hgtArr[x]
+    noise_line(4.0)
+    for x in range(COLS):
+        n2Arr[x] = hgtArr[x]
+    for x in range(COLS):
+        c1 = x - COLS * 0.44
+        c2 = x - COLS * 0.8
+        m = 17.0 * ti.exp(-c1 * c1 / (2.0 * 15.0 * 15.0)) + 8.0 * ti.exp(-c2 * c2 / (2.0 * 8.0 * 8.0))
+        hgtArr[x] = ROWS * 0.66 - m - n1Arr[x] * 5.0 - n2Arr[x] * 2.2
+    cavX[None] = COLS * (0.4 + ti.random() * 0.12)
+    cavY[None] = ROWS * 0.74
+    cavRX[None] = 5.0 + ti.random() * 2.5
+    cavRY[None] = 2.8 + ti.random() * 1.4
+    y = 0
+    while y < ROWS:
+        x = 0
+        while x < COLS:
+            cell = y * COLS + x
+            fixed = 1
+            if y < ROWS - 2:
+                cutoff = ti.max(4, int(hgtArr[x] + 0.5))
+                if y < cutoff:
+                    x += 1
+                    continue
+                dx = (x + 0.5 - cavX[None]) / cavRX[None]
+                dy = (y + 0.5 - cavY[None]) / cavRY[None]
+                if dx * dx + dy * dy < 1.0:
+                    x += 1
+                    continue
+                fixed = 1 if y >= ROWS - P[None].fixedRows else 0
+            i = add_block_func(x + 0.5, y + 0.5, 1.0, fixed)
+            if i >= 0:
+                r_filled[cell] = 1
+                r_block[cell] = i
+            x += 1
+        y += 1
+    if weak == 1:
+        nj = 4 + int(ti.random() * 3)
+        jn = 0
+        while jn < nj:
+            jx = int(4.0 + ti.random() * (COLS - 8))
+            jy = 0
+            while jy < ROWS - 1 and r_filled[jy * COLS + jx] == 0:
+                jy += 1
+            ang = PI * 0.5 + (ti.random() - 0.5) * 1.1
+            cx2 = jx
+            cy2 = jy
+            fx = jx + 0.5
+            fy = jy + 0.5
+            ln = int(7.0 + ti.random() * 11)
+            s = 0
+            while s < ln:
+                fx += ti.cos(ang) * 0.9
+                fy += ti.sin(ang) * 0.9
+                ang += (ti.random() - 0.5) * 0.55
+                nx = int(fx)
+                ny = int(fy)
+                if nx < 1 or nx >= COLS - 1 or ny < 1 or ny >= ROWS - 2 or r_filled[ny * COLS + nx] == 0:
+                    break
+                if nx != cx2 or ny != cy2:
+                    cut_between(cx2, cy2, nx, ny)
+                    cx2 = nx
+                    cy2 = ny
+                s += 1
+            jn += 1
+    c = 0
+    while c < N:
+        a = r_block[c]
+        if a >= 0:
+            if (c % COLS) < COLS - 1 and r_block[c + 1] >= 0:
+                add_bond_func(a, r_block[c + 1], 1.0, 1 if cutR[c] == 0 else 0)
+            if (c // COLS) < ROWS - 1 and r_block[c + COLS] >= 0:
+                add_bond_func(a, r_block[c + COLS], 1.0, 1 if cutD[c] == 0 else 0)
+        c += 1
+    k = 0
+    while k < 240:
+        a = ti.random() * 2.0 * PI
+        rr = ti.sqrt(ti.random())
+        spawn_particle(
+            cavX[None] + ti.cos(a) * rr * cavRX[None] * 0.85,
+            cavY[None] + ti.sin(a) * rr * cavRY[None] * 0.6 + cavRY[None] * 0.25,
+            0.02,
+            PI * 0.5,
+        )
+        k += 1
+
+
+@ti.kernel
+def gen_solid():
+    """Полностью заполненный массив породой (монолит без полостей)."""
+    for c in range(N):
+        r_filled[c] = 0
+        r_block[c] = -1
+    c = 0
+    while c < N:
+        fixed = 1 if c // COLS >= ROWS - P[None].fixedRows else 0
+        i = add_block_func((c % COLS) + 0.5, (c // COLS) + 0.5, 1.0, fixed)
+        if i >= 0:
+            r_filled[c] = 1
+            r_block[c] = i
+        c += 1
+    c = 0
+    while c < N:
+        a = r_block[c]
+        if a >= 0:
+            if (c % COLS) < COLS - 1 and r_block[c + 1] >= 0:
+                add_bond_func(a, r_block[c + 1], 1.0, 1)
+            if (c // COLS) < ROWS - 1 and r_block[c + COLS] >= 0:
+                add_bond_func(a, r_block[c + COLS], 1.0, 1)
+        c += 1
+
+
+def build_bigblocks():
+    """Сцена с блоками ПРОИЗВОЛЬНОГО размера (мозаика 1..3 клетки).
+
+    Модель строится на CPU (списки) и передаётся в решатель через build_model —
+    демонстрация, что решатель не привязан ни к сетке, ни к размеру блока.
+    """
+    cx = COLS * 0.5
+    cy = ROWS * 0.6
+    rx = 7.0
+    ry = 5.0
+    occ = [[0] * COLS for _ in range(ROWS)]
+    for y in range(ROWS):
+        for x in range(COLS):
+            dx = (x + 0.5 - cx) / rx
+            dy = (y + 0.5 - cy) / ry
+            if dx * dx + dy * dy < 1.0:
+                occ[y][x] = -1   # полость выработки
+    blocks = []
+    for y in range(ROWS):
+        for x in range(COLS):
+            if occ[y][x] != 0:
+                continue
+            maxs = min(3, COLS - x, ROWS - y)
+            r = random.random()
+            s = 3 if r < 0.2 else (2 if r < 0.55 else 1)
+            if s > maxs:
+                s = maxs
+            fits = True
+            for yy in range(y, y + s):
+                for xx in range(x, x + s):
+                    if occ[yy][xx] != 0:
+                        fits = False
+                        break
+                if not fits:
+                    break
+            if not fits:
+                occ[y][x] = 1
+                continue
+            fixed = 1 if y >= ROWS - P[None].fixedRows else 0
+            idx = len(blocks)
+            blocks.append((x + s / 2.0, y + s / 2.0, float(s), fixed))
+            for yy in range(y, y + s):
+                for xx in range(x, x + s):
+                    occ[yy][xx] = idx + 1
+    bonds = []
+    seen = set()
+    for y in range(ROWS):
+        for x in range(COLS):
+            b = occ[y][x]
+            if b <= 0:
+                continue
+            a0 = b - 1
+            for (xx, yy) in ((x + 1, y), (x, y + 1)):
+                if xx >= COLS or yy >= ROWS:
+                    continue
+                c = occ[yy][xx]
+                if c <= 0 or c == b:
+                    continue
+                a1 = c - 1
+                if (a0, a1) in seen or (a1, a0) in seen:
+                    continue
+                dx = blocks[a1][0] - blocks[a0][0]
+                dy = blocks[a1][1] - blocks[a0][1]
+                rest = abs(dx) if abs(dx) >= abs(dy) else abs(dy)
+                bonds.append((a0, a1, rest, 1))
+                seen.add((a0, a1))
+    water = []
+    for _ in range(200):
+        a = random.uniform(0.0, 2.0 * math.pi)
+        rr = math.sqrt(random.random())
+        water.append((cx + math.cos(a) * rr * rx * 0.85,
+                      cy + math.sin(a) * rr * ry * 0.6 + ry * 0.25,
+                      0.02, math.pi * 0.5))
+    build_model(blocks, bonds, water, (cx, cy, rx, ry))
+
+
+def generate(mode, weak):
+    """Построить модель сцены и передать её в решатель.
+
+    mode 0 — выработка (единичные блоки), mode 1 — склон, mode 2 — мозаика
+    произвольных размеров (build_model). weak — ослабленные плоскости."""
+    if mode == 2:
+        build_bigblocks()
+        return
+    reset_all()
+    if mode == 0:
+        gen_tunnel(weak)
+    else:
+        gen_slope(weak)
+
+
+@ti.kernel
+def rebuild_occ():
+    for c in range(N):
+        r_block[c] = -1
+    for i in range(bcount[None]):
+        cxi = clamp_cell(bx[i])
+        cyi = clamp_cell(by[i])
+        r_block[cyi * COLS + cxi] = i
+
+
+# ================================================================== инструменты
+@ti.kernel
+def stamp_rock(x: ti.f32, y: ti.f32, r: ti.f32):
+    cx = int(x)
+    cy = int(y)
+    rr = int(ti.ceil(r))
+    oy = -rr
+    while oy <= rr:
+        ox = -rr
+        while ox <= rr:
+            ax = cx + ox
+            ay = cy + oy
+            if ax >= 0 and ax < COLS and ay >= 0 and ay < ROWS - 1:
+                if ox * ox + oy * oy <= r * r:
+                    cell = ay * COLS + ax
+                    if r_block[cell] < 0:
+                        fixed = 1 if ay >= ROWS - P[None].fixedRows else 0
+                        i = add_block_func(ax + 0.5, ay + 0.5, 1.0, fixed)
+                        if i >= 0:
+                            if ax > 0 and r_block[cell - 1] >= 0:
+                                add_bond_func(r_block[cell - 1], i, 1.0, 1)
+                            if ax < COLS - 1 and r_block[cell + 1] >= 0:
+                                add_bond_func(i, r_block[cell + 1], 1.0, 1)
+                            if ay > 0 and r_block[cell - COLS] >= 0:
+                                add_bond_func(r_block[cell - COLS], i, 1.0, 1)
+                            if ay < ROWS - 1 and r_block[cell + COLS] >= 0:
+                                add_bond_func(i, r_block[cell + COLS], 1.0, 1)
+                            r_block[cell] = i
+            ox += 1
+        oy += 1
+
+
+@ti.kernel
+def stamp_erase(x: ti.f32, y: ti.f32, r: ti.f32):
+    i = bcount[None] - 1
+    while i >= 0:
+        if bfixed[i] == 0:
+            dx = bx[i] - x
+            dy = by[i] - y
+            if dx * dx + dy * dy < r * r:
+                remove_block_func(i)
+        i -= 1
+
+
+@ti.kernel
+def crack_at(x: ti.f32, y: ti.f32, r: ti.f32):
+    r2 = r * r
+    for bd in range(bondCount[None]):
+        if bondIntact[bd] == 1:
+            mx = (bx[bondA[bd]] + bx[bondB[bd]]) * 0.5 - x
+            my = (by[bondA[bd]] + by[bondB[bd]]) * 0.5 - y
+            if mx * mx + my * my < r2:
+                a = bondA[bd]
+                b = bondB[bd]
+                bondIntact[bd] = 0
+                clear_bond_bit(a, b)
+                ti.atomic_add(broken[None], 1)
+                breakCrush[None] = 0
+                dx = bx[b] - bx[a]
+                dy = by[b] - by[a]
+                d = ti.sqrt(dx * dx + dy * dy)
+                kx = 0.15
+                ky = 0.0
+                if d > 1e-9:
+                    kx = dx / d * 0.15
+                    ky = dy / d * 0.15
+                bvx[a] -= kx
+                bvy[a] -= ky
+                bvx[b] += kx
+                bvy[b] += ky
+
+
+@ti.kernel
+def clear_scene():
+    """Оставить только закреплённые блоки, связи пересобрать по геометрии."""
+    n = 0
+    i = 0
+    while i < bcount[None]:
+        if bfixed[i] == 1:
+            if i != n:
+                bx[n] = bx[i]
+                by[n] = by[i]
+                bvx[n] = bvx[i]
+                bvy[n] = bvy[i]
+                bfx[n] = bfx[i]
+                bfy[n] = bfy[i]
+                wfx[n] = wfx[i]
+                wfy[n] = wfy[i]
+                ovf[n] = ovf[i]
+                bfixed[n] = bfixed[i]
+                bshade[n] = bshade[i]
+                bstress[n] = bstress[i]
+                bstressC[n] = bstressC[i]
+                brot[n] = brot[i]
+                bw[n] = bw[i]
+                btor[n] = btor[i]
+                nbond[n] = nbond[i]
+                bsz[n] = bsz[i]
+                hx[n] = hx[i]
+                hy[n] = hy[i]
+            n += 1
+        i += 1
+    bcount[None] = n
+    bondCount[None] = 0
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n:
+            ri = bsz[i] * 0.5
+            rj = bsz[j] * 0.5
+            dx = bx[j] - bx[i]
+            dy = by[j] - by[i]
+            axx = ti.abs(dx)
+            ayy = ti.abs(dy)
+            rs = ri + rj
+            if axx > rs - 0.05 and axx < rs + 0.05 and ayy < ti.min(ri, rj):
+                add_bond_func(i, j, ti.sqrt(dx * dx + dy * dy), 1)
+            elif ayy > rs - 0.05 and ayy < rs + 0.05 and axx < ti.min(ri, rj):
+                add_bond_func(i, j, ti.sqrt(dx * dx + dy * dy), 1)
+            j += 1
+        i += 1
+    pCount[None] = 0
+    dustCount[None] = 0
+    broken[None] = 0
+    for s in range(FRIC_SLOTS):
+        fricKey[s] = -1
+        fricS[s] = 0.0
+        fricF[s] = 0
+
+
+@ti.kernel
+def dust_step():
+    for i in range(dustCount[None]):
+        if i >= MAXDUST:
+            continue
+        dustX[i] += dustVX[i]
+        dustY[i] += dustVY[i]
+        dustVY[i] += 0.004
+        dustLife[i] -= 0.04
+
+
+@ti.kernel
+def dust_compact():
+    w = 0
+    i = 0
+    while i < dustCount[None]:
+        if i < MAXDUST and dustLife[i] > 0.0:
+            dustX[w] = dustX[i]
+            dustY[w] = dustY[i]
+            dustVX[w] = dustVX[i]
+            dustVY[w] = dustVY[i]
+            dustLife[w] = dustLife[i]
+            dustCol[w] = dustCol[i]
+            w += 1
+        i += 1
+    dustCount[None] = w
+
+
+# ================================================================== ввод
+def do_stroke(mx, my, last_mx, last_my, tool, brush):
+    dx = mx - last_mx
+    dy = my - last_my
+    dist = math.hypot(dx, dy)
+    steps = max(1, int(math.ceil(dist / 0.35)))
+    r_rock = brush / 2.0 + 0.4
+    r_crack = brush / 2.0 + 0.25
+    if tool == 0:
+        rebuild_occ()
+    for s in range(1, steps + 1):
+        t = s / steps
+        x = last_mx + dx * t
+        y = last_my + dy * t
+        if tool == 0:
+            stamp_rock(x, y, r_rock)
+        elif tool == 1:
+            crack_at(x, y, r_crack)
+        elif tool == 3:
+            stamp_erase(x, y, r_rock)
+    return mx, my
+
+
+# ================================================================== selftest / GUI
 def run_selftest(frames=120):
     apply_gravity(1.0)
     apply_rock(10.0, 4.0, 0.62)
@@ -342,7 +881,6 @@ def run_selftest(frames=120):
     if broken[None] > 0:
         print("selftest: WARNING — bonds broke during settle (broken=%d)" % broken[None])
 
-    # инструменты
     t0 = time.perf_counter()
     crack_at(COLS * 0.5, ROWS * 0.2, 2.5)
     nb1 = count_intact()
@@ -361,7 +899,6 @@ def run_selftest(frames=120):
         % (nb1, nb2, nb3, nb4, t_tools)
     )
 
-    # вода
     t0 = time.perf_counter()
     generate(0, 0)
     spawn_water(1200, 0.03, COLS * 0.5, ROWS * 0.3, PI * 0.5)
@@ -371,6 +908,20 @@ def run_selftest(frames=120):
     t_wat = time.perf_counter() - t0
     print("selftest: water pcount=%d fill=%.0f%% broken=%d (%.2fs)" % (pCount[None], fp, broken[None], t_wat))
     print("selftest: WARNING — water not contained" if fp < 5.0 else "")
+
+    # мозаика произвольных размеров
+    t0 = time.perf_counter()
+    generate(2, 0)
+    ms = P[None].maxSize
+    for f in range(20):
+        step_physics(2, DT)
+    t_big = time.perf_counter() - t0
+    print(
+        "selftest: bigblocks n=%d maxSize=%d intact=%d broken=%d (%.2fs)"
+        % (bcount[None], ms, count_intact(), broken[None], t_big)
+    )
+    if broken[None] > bcount[None] // 4:
+        print("selftest: WARNING — bigblocks collapsed (broken=%d)" % broken[None])
 
     # рендер одного кадра (без окна)
     t0 = time.perf_counter()
@@ -401,10 +952,12 @@ def run_gui():
     mode = 0
     tool = 0
     brush = 2
-    paused = False
+    paused = True
     weak = 0
     show_bonds = 1
     E_GPa = 10
+    rho = RHO_R
+    scene_names = {0: "vyrabotka", 1: "sklon", 2: "krupnye bloki"}
 
     window = ti.ui.Window("ГЕОМАССИВ/2D · DEM", (W, H), vsync=True)
     canvas = window.get_canvas()
@@ -418,7 +971,7 @@ def run_gui():
     last_mx = -1.0
     last_my = -1.0
     rain_until = 0.0
-    flash_msg = "Massiv: svyazey %d" % count_intact()
+    flash_msg = "Nazhmite СТАРТ - simulyatsiya nachnetsya"
     flash_t = 0.0
     last_broken = 0
     last_hud_broken = 0
@@ -468,7 +1021,11 @@ def run_gui():
 
         # ---- GUI
         gui.begin("Upravlenie", 0.72, 0.02, 0.27, 0.96)
-        gui.text("Scena: %s" % ("vyrabotka" if mode == 0 else "sklon"))
+        if gui.button("СТАРТ" if paused else "СТОП"):
+            paused = not paused
+            flash_msg = "Симуляция запущена" if not paused else "Пауза"
+            flash_t = t_sim
+        gui.text("Scena: %s" % scene_names[mode])
         gui.text("Poroda: E=%d GPa, Rt=%d MPa, Rc=%d MPa" % (E_GPa, int(P[None].rp), int(P[None].rp * P[None].rcFactor)))
         gui.text("Napor: %.2f MPa na porodu" % (RHO_W * G_PHYS * P[None].head / 1e6))
         gui.text("LKM - instrument * PKM - istochnik")
@@ -486,8 +1043,13 @@ def run_gui():
         mu_new = gui.slider_int("Trenie mu %%", int(P[None].mu * 100), 20, 90)
         if E_new != E_GPa or rp_new != int(P[None].rp) or mu_new != int(P[None].mu * 100):
             E_GPa = E_new
-            apply_rock(E_GPa, float(rp_new), mu_new / 100.0)
-        P[None].depth = gui.slider_int("Poroda nad skhemoy, m", int(P[None].depth), 0, 400)
+            apply_rock(E_GPa, float(rp_new), mu_new / 100.0, rho)
+        P[None].depth = gui.slider_int("Poroda nad skhemoy, m", int(P[None].depth), 0, 3000)
+        rho_new = gui.slider_int("Plotnost porody, kg/m3", int(rho), 1000, 3500)
+        if rho_new != rho:
+            rho = float(rho_new)
+            apply_rock(E_GPa, float(P[None].rp), P[None].mu, rho)
+            apply_water(P[None].head)
         P[None].k0 = gui.slider_float("K0 bokovogo davleniya", P[None].k0, 0.0, 2.0)
         P[None].fixedRows = gui.slider_int("Zakrepl. ryadov", P[None].fixedRows, 1, 4)
         P[None].brkCap = gui.slider_int("Limit razryvov/kadr", P[None].brkCap, 1, 200)
@@ -513,9 +1075,17 @@ def run_gui():
                 mode = 1
                 srcCount[None] = 0
                 generate(mode, weak)
+        if gui.button("Krupnye bloki"):
+            if mode != 2:
+                mode = 2
+                srcCount[None] = 0
+                generate(mode, weak)
+                flash_msg = "Mozaika: blokov %d, max razmer %d" % (bcount[None], P[None].maxSize)
+                flash_t = t_sim
         if gui.button("Zapolnit massiv"):
             srcCount[None] = 0
-            generate_solid()
+            reset_all()
+            gen_solid()
             flash_msg = "Massiv zapolnen: blokov %d" % bcount[None]
             flash_t = t_sim
         if gui.button("Peregenerirovat"):
@@ -544,6 +1114,9 @@ def run_gui():
             flash_t = t_sim
         if gui.button("Pauza / Pusk (Space)"):
             paused = not paused
+            if not paused:
+                flash_msg = "Симуляция запущена"
+            flash_t = t_sim
         fp = fill_pct()
         gui.text("fps %.0f * blokov %d" % (fps, bcount[None]))
         gui.text("chastits h2o %d%s * svyazey %d" % (pCount[None], " (MAX)" if pCount[None] >= PMAX else "", count_intact()))
@@ -558,6 +1131,8 @@ def run_gui():
                 rx = 1.0 + (math.sin(t_sim * 13.7) * 0.5 + 0.5) * (COLS - 2)
                 spawn_water(2, 0.03, rx, 1.2, PI * 0.5)
             step_physics(mode, DT)
+            dust_step()
+            dust_compact()
             if broken[None] != last_broken:
                 if broken[None] % 8 == 1:
                     flash_msg = "Smyatie porody (Rc)" if breakCrush[None] == 1 else "Razryv svyazi (Rp)"
