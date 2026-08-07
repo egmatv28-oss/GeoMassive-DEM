@@ -238,6 +238,9 @@ bcount = ti.field(ti.i32, shape=())
 # сетка верхней нагрузки (только по колонкам)
 topYArr = ti.field(ti.f32, COLS)
 topCol = ti.field(ti.i32, COLS)
+# индекс досыпанного за текущий тик обломка для каждой колонки (-1 = нет),
+# чтобы связывать между собой только НОВЫЕ обломки (не со старым массивом)
+newRubble = ti.field(ti.i32, COLS)
 
 # топология массива: занятость клетки блоком + вертикальная перегрузка (сверху вниз)
 gOcc = ti.field(ti.i32, N)
@@ -277,7 +280,6 @@ fricF = ti.field(ti.f32, FRIC_SLOTS)   # момент последнего ко�
 simT = ti.field(ti.f32, shape=())       # внутреннее время симуляции, с (не зависит от кадров)
 compactT = ti.field(ti.f32, shape=())   # simT последней пересборки связей, с
 loadCur = ti.field(ti.f32, shape=())
-loadRamp = ti.field(ti.f32, shape=())
 broken = ti.field(ti.i32, shape=())
 frameBrk = ti.field(ti.i32, shape=())
 breakCrush = ti.field(ti.i32, shape=())
@@ -382,7 +384,7 @@ def refresh_field():
         cyi = row_cell(by[i])
         gOcc[cyi * COLS + cxi] = 1
     for x in range(COLS):
-        carry = loadCur[None] * loadRamp[None]
+        carry = loadCur[None]
         y = 0
         while y < ROWS:
             c = y * COLS + x
@@ -1056,11 +1058,11 @@ def compute_top_load_fused(mode: ti.i32):
     # 1. обнуление ovf
     for i in range(bcount[None]):
         ovf[i] = 0.0
-    # 2. обновление нагрузки
+    # 2. нагрузка: в режиме шахты (mode==0) давление на верхний ряд прикладывается
+    #    ВСЕГДА — сразу полным весом породы над схемой (depth), без плавного
+    #    нарастания. В остальных режимах (склон/мозаика) нагрузки сверху нет.
     if mode == 0:
-        loadCur[None] += (P[None].depth * LOAD_OVER - loadCur[None]) * 0.04
-        if loadRamp[None] < 1.0:
-            loadRamp[None] = ti.min(1.0, loadRamp[None] + LOAD_RAMP_RATE * TICK)
+        loadCur[None] = P[None].depth * LOAD_OVER
     else:
         loadCur[None] = 0.0
     # 3. поиск верхних блоков (вложенный цикл, один kernel)
@@ -1074,16 +1076,62 @@ def compute_top_load_fused(mode: ti.i32):
                 best = i
         topCol[c] = best
         topYArr[c] = bestY
-    # 4. применение нагрузки
-    f = loadCur[None] * loadRamp[None]
+    # 4. приложение нагрузки: полный вес давит на верхний блок каждой колонки
+    f = loadCur[None]
     for c in range(COLS):
         i = topCol[c]
         if i >= 0:
             ovf[i] = f
 
 
+@ti.kernel
+def refill_top_overburden(mode: ti.i32):
+    """Досыпка обломков сверху (модель "кучи породы над выработкой").
+
+    Каждый тик проверяем верх колонок: если верхняя клетка колонки пуста
+    (кровля просела/обрушилась), кладём туда новый ОДИНОЧНЫЙ обломок. Он НЕ
+    связывается со старыми блоками (пришёл сверху), но если в этом же тике
+    досыпаны обломки в соседние колонки — они связываются между собой (если
+    рядом). Так обрушение сверху просто приносит новые блоки вниз, как кучу
+    породы в шахте."""
+    if mode == 0:
+        c = 0
+        while c < COLS:
+            newRubble[c] = -1
+            c += 1
+        # 1. находим верхний блок каждой колонки и досыпаем при пустой верхней клетке
+        c = 0
+        while c < COLS:
+            best = -1
+            bestY = 1e9
+            i = 0
+            while i < bcount[None]:
+                cc = clamp_cell(bx[i])
+                if cc == c and by[i] < bestY:
+                    bestY = by[i]
+                    best = i
+                i += 1
+            # верхняя клетка (y=0) свободна, если в колонке вообще нет блока,
+            # либо самый верхний блок опустился ниже неё
+            if best < 0 or bestY >= 1.0:
+                j = add_block_func(c + 0.5, 0.5, 1.0, 0)
+                if j >= 0:
+                    newRubble[c] = j
+            c += 1
+        # 2. связываем только новые обломки соседних колонок (старые не трогаем)
+        c = 0
+        while c < COLS:
+            a = newRubble[c]
+            if a >= 0 and c + 1 < COLS:
+                b = newRubble[c + 1]
+                if b >= 0:
+                    add_bond_func(a, b, 1.0, 1)
+            c += 1
+
+
 def compute_top_load(mode):
     compute_top_load_fused(mode)
+    refill_top_overburden(mode)
 
 
 # ================================================================== флюид
@@ -1428,7 +1476,6 @@ def reset_all():
     dustCount[None] = 0
     broken[None] = 0
     loadCur[None] = 0.0
-    loadRamp[None] = 0.0
     capWarned[None] = 0
     filledFlag[None] = 0
     srcCount[None] = 0
@@ -1448,6 +1495,7 @@ def reset_all():
     for c in range(COLS):
         topCol[c] = -1
         topYArr[c] = 1e9
+        newRubble[c] = -1
     for s in range(FRIC_SLOTS):
         fricKey[s] = -1
         fricS[s] = 0.0
@@ -1566,7 +1614,6 @@ TOPO_EVERY = 48   # пересборка топологии (хэш, nbond, по
                   # 48 — баланс между свежестью топологии и стабильностью
 FRIC_FORGET_T = 3.0 * TICK        # с: как долго "помнить" накопленный сдвиг трения
 COMPACT_EVERY_T = 0.5             # с: период пересборки/уплотнения связей
-LOAD_RAMP_RATE = 2.0 / 3.0        # 1/с: скорость нарастания верхней нагрузки (полная за 1.5 с)
 SLEEP_V2 = 1.5e-3                 # (клетки/с)²: порог скорости "уснувшего" блока
 SLEEP_A2 = 4.0                    # (клетки/с²)²: порог равнодействующей силы — блок спит только
                                   # если почти неподвижен И силы уравновешены (лежит на опоре), иначе
