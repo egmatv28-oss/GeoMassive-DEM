@@ -1,944 +1,94 @@
-"""ГЕОМАССИВ/2D · DEM — решатель (физический движок)
+"""ГЕОМАССИВ/2D · DEM — решатель: тик времени и оркестрация физики (solver)
 
-Чистый физический движок: дискретно-элементный метод (DEM) для породы
-+ Position-Based Dynamics (SPH) для флюида. Не знает про сцены, инструменты
-и GUI: модель (список блоков/связей/воды/полости) строится СНАРУЖИ
-(render.py) и загружается через build_model() либо через примитивы
-add_block_func / add_bond_func / spawn_particle.
+Главный модуль физического движка. Его задача — чтобы физика работала РАВНОМЕРНО
+и для всех блоков одновременно (плоскопараллельно), с соблюдением закона
+сохранения энергии.
 
-Блоки — квадраты ПРОИЗВОЛЬНОГО размера в произвольной конфигурации:
-у каждого блока свой размер bsz[i], у каждой связи своя длина покоя
-brest[bd] и начальное направление bondNX/bondNY. Сетка нужна только как
-пространственный хэш (hhead) и для хранения полей фона. Физика, генерация
-и инструменты — в render.py, точка входа — mineudec.py.
+Каждый ТИК (step_physics) строит единый распорядок, одинаковый для всех блоков:
+  1) проходка состояния — топология, напряжённое поле, контактный хэш, связи;
+  2) передача на расчёт — силы взаимодействий считаются в interactions.py
+     (phys_reset / phys_bonds / phys_contact) одним параллельным проходом
+     по всем блокам;
+  3) приём и обработка  — phys_integrate читает полученные силы (bfx/bfy/btor),
+     интегрирует скорости/позиции, демпфирует, держит блоки в домене;
+  4) сводка интегралов  — compute_energy() (полная энергия КАЖДОГО блока и всей
+     системы, закон сохранения энергии) и center_of_mass() (центр тяжести)
+     после каждого тика.
 
-DEM: клетка = 1 м, блок m = 1 кг (эффективная масса). Силы: Ft = Rp[МПа]·400.
-Флюид: Position-Based Dynamics (SPH-плотность), контакт с породой герметичен —
-вода идёт только в раскрытые трещины.
+Решатель не знает про сцены, инструменты и GUI: модель строится СНАРУЖИ
+(render.py) и загружается через build_model() либо примитивы
+add_block_func / add_bond_func / spawn_particle. Состояние — в physstate.py.
+Точка входа — mineudec.py.
 """
 
-import sys
-import os
-import pathlib
-import tempfile
-import shutil
-import importlib.util
-import argparse
-import time
 import math
+import time
 
 import numpy as np
 
+import taichi as ti
 
-def _is_ascii_path(p):
-    try:
-        p.encode("ascii")
-        return True
-    except UnicodeEncodeError:
-        return False
-
-
-def _short_ascii_path(p):
-    """Возвращает короткий (8.3) ASCII-путь, если исходный содержит не-ASCII."""
-    if _is_ascii_path(p):
-        return p
-    try:
-        import ctypes
-        buf = ctypes.create_unicode_buffer(1024)
-        n = ctypes.windll.kernel32.GetShortPathNameW(p, buf, 1024)
-        if n and _is_ascii_path(buf.value):
-            return buf.value
-    except Exception:
-        pass
-    return None
-
-
-def _bootstrap_taichi():
-    """GGUI (Vulkan) не может открыть свои shaders по пути с не-ASCII (кириллица в
-    имени пользователя). Если taichi установлен в такой каталог — копируем пакет в
-    ASCII-временную папку и подключаем её первой в sys.path."""
-    spec = importlib.util.find_spec("taichi")
-    if spec is None:
-        return
-    origin = spec.origin or ""
-    if _is_ascii_path(origin):
-        return
-    dst_root = pathlib.Path(tempfile.gettempdir()) / "opencode_taichi_pkg"
-    root_str = _short_ascii_path(str(dst_root)) or str(dst_root)
-    dst_root = pathlib.Path(root_str)
-    dst = dst_root / "taichi"
-    src = pathlib.Path(origin).parent
-    ver = "1.7.4"
-    marker = dst / ".opencode_ascii"
-    if not (marker.exists() and marker.read_text() == ver):
-        if dst.exists():
-            shutil.rmtree(str(dst))
-        dst_root.mkdir(parents=True, exist_ok=True)
-        print("[bootstrap] копирую taichi в ASCII-путь:", dst_root)
-        shutil.copytree(str(src), str(dst))
-        marker.write_text(ver)
-    if str(dst_root) not in sys.path:
-        sys.path.insert(0, str(dst_root))
-
-
-_bootstrap_taichi()
-
-import taichi as ti  # noqa: E402
-
-ti.init(arch=ti.vulkan)
-
-# ------------------------------------------------------------------ константы
-COLS = 72
-ROWS = 44
-CELL = 16
-W = COLS * CELL
-H = ROWS * CELL
-N = COLS * ROWS
-MAXB = 4096
-MAXBONDS = 8192
-MAXP = 5200
-PMAX = 5000
-MAXDUST = 240
-MAXSRC = 4
-MAXNB = 24
-BMAPW = (MAXB + 31) // 32   # слов битовой карты связей (пар блоков)
-MAXNBR = 4   # статический радиус поиска соседей контакта (в клетках);
-             # покрывает блоки до размеров MAXNBR*2 клеток рядом; динамический
-             # радиус фильтруется в рантайме (см. phys_contact)
-
-# параметры флюида (константы) — wg динамический, хранится в поле
-H_SPH = 0.72
-RHO0 = 2.6
-KP = 0.32
-KN = 0.64
-RP_SPH = 0.28
-
-PI = 3.14159265
-
-# ================================================================ физический масштаб
-# ЕДИНИЦА ВРЕМЕНИ МОДЕЛИ — ТИК: 1 тик = TICK = 1/60 с. Внутреннее время НЕ
-# привязано к кадрам/реальному времени: решатель — локальная физика, каждый
-# вызов step_physics() двигает модель на ровно один тик, а дальше работает
-# так быстро, как позволяет CPU. Тик — дробная доля реальной секунды (1/60),
-# остальные величины (клетка, плотность, ускорение) привязаны к этому масштабу.
-# Порода — песчаник средней прочности.
-# Все параметры дем-модели выводятся из этих величин: apply_rock / apply_water / apply_gravity.
-LCELL = 0.5                 # м на клетку
-RHO_R = 2500.0              # плотность породы, кг/м3
-RHO_W = 1000.0              # плотность воды, кг/м3
-G_PHYS = 9.81               # ускорение свободного падения, м/с2
-TICK = 1.0 / 60.0           # с: время модели за один тик (единица расчёта времени)
-VEL_SCALE = TICK / LCELL    # м/с -> клетки/тик
-G_SIM = G_PHYS / LCELL      # ускорение для породы, клетки/с2
-DT_FLUID = 0.25             # шаг флюида в тиках (3 подшага = 0.75 тика на тик)
-NFLUID_STEPS = 3            # число подшагов флюида за тик
-# ускорение флюида: 3 подшага по DT_FLUID тика на тик -> N*DT=0.75 тика,
-# чтобы дать ровно G_PHYS, нужно fwg*N*DT = G_SIM*TICK^2:
-FWG_BASE = G_SIM * TICK * TICK / (NFLUID_STEPS * DT_FLUID)
-BLOCK_M = RHO_R * LCELL * LCELL   # масса 2D-блока (толщина 1 м), кг
-FT_SIGMA = 1e6 / (RHO_R * LCELL)   # 1 МПа прочности -> клетки/с2
-WPRESS = RHO_W * G_PHYS / (RHO_R * LCELL)  # 1 м напора -> клетки/с2 на блок
-LOAD_OVER = G_PHYS / (LCELL)     # 1 м глубины -> клетки/с2 на блок
-K0_LATERAL = 1.0            # коэффициент бокового давления (σ_h = K0·σ_v); 1.0 — гидростатический распор глубокого массива
-# коэффициент бокового давления ОБРУШЕННОЙ (рыхлой) породы: меньше, чем у массива
-# (активное давление Ka ~ tan²(45°−φ/2); для φ≈30° это ~0.33). Обломки давят друг
-# на друга и на массив слабее, но всё равно дают боковой распор.
-K0_RUBBLE = 0.33
-
+from physstate import *
+from interactions import *
 
 def apply_gravity(scale):
-    P[None].g = G_SIM * scale
+    P[None].g = G_PHYS * scale
     fwg[None] = FWG_BASE * scale
 
 
 def apply_rock(E_GPa, rp_MPa, mu, rho=None):
-    E = E_GPa * 1e9
-    kb = E / (RHO_R * LCELL)
-    P[None].kb = kb
-    P[None].kn = kb
-    P[None].ks = kb / (2.0 * (1.0 + 0.25))   # G = E/2(1+nu), nu = 0.25
-    P[None].kts = kb * 0.2
-    P[None].cn = 0.32 * math.sqrt(kb)   # демпфирование контакта, zeta ~ 0.28, гасит колебания при жёсткой связи
-    P[None].cnc = 1.2 * math.sqrt(kb)   # демпфирование КОНТАКТА блоков (ζ≈0.6): чуть выше исходного (ζ≈0.48),
-                                        # заметно гасит подпрыгивание обломков. Больше брать НЕЛЬЗЯ: эмпирически
-                                        # 1.6·√kb и выше дают взрывной каскад при росте нагрузки (трещины сверху),
-                                        # а полное критическое 2·√kb рвёт связи уже при усадке.
+    E = E_GPa * 1e9                      # модуль Юнга, Н/м2
+    P[None].E = E
+    if rho is not None:
+        P[None].rho = rho
+        update_mass_rho()
+    elif P[None].rho == 0.0:
+        P[None].rho = RHO_R
+    # ζ — относительное демпфирование (доля критического) пары блоков:
+    # оно же используется и для связей, и для контактов (см. phys_bonds/phys_contact).
+    P[None].cn = 0.28    # ζ связи: гасит колебания при жёсткой связи (в критич. единицах)
+    P[None].cnc = 0.6    # ζ КОНТАКТА блоков: заметно гасит подпрыгивание обломков.
+                         # Больше брать НЕЛЬЗЯ: эмпирически ζ≈0.8 и выше дают взрывной
+                         # каскад при росте нагрузки, а полное критическое 2·√(k/m)
+                         # рвёт связи уже при усадке.
+    P[None].cncR = 1.1   # ζ контакта ДВУХ СВОБОДНЫХ блоков (оба nbond==0): перекритическое
+                         # демпфирование — падающий обломок не отскакивает от рухляка.
+                         # На связанный массив не влияет (там ζ=cnc).
     P[None].rp = rp_MPa
     P[None].mu = mu
     P[None].ftScale = FT_SIGMA
     P[None].rcFactor = 10.0
     P[None].fsFactor = 2.0
+    # Честный Мора-Кулон на связи: сдвиговая прочность шва зависит от нормального
+    # напряжения по шву (tension>0 — растяжение, tension<0 — обжатие).
+    # τ_s = Fs0 + mcBond·σ_n, где σ_n = tension. Обжатие (σ_n<0) добавляет
+    # прочности на сдвиг, растяжение (σ_n>0) — отнимает. mcBond — тангенс угла
+    # внутреннего трения по шву (реалистичный ~tan 35°≈0.7).
+    P[None].mcBond = 0.7
     P[None].k0 = K0_LATERAL
     P[None].relBend = 0.15
     P[None].dmgMax = 6.0
     P[None].dmgDecay = 0.85   # быстрее "забывает" перегрузку: дальние связи не рвутся, обвал не расползается
     P[None].brkCap = 24
+    # Пластическое течение (крип) связей — как в реальной породе: выше предела
+    # текучести связь медленно "течёт" (остаточная длина растёт), продолжая
+    # передавать усилие и оставаясь герметичной; обрыв наступает после накопления
+    # предельной пластической деформации (plastLimit).
+    P[None].plastYield = 0.5   # крип (пластическая стадия) начинается с ~50% прочности —
+                            # раньше (0.65), чтобы перегруз расползался постепенно, а не рвался
+    P[None].plastLimit = 0.32  # обрыв при ~32% накопленной криповой деформации (было 0.24) —
+                                # больше запаса до разрыва, связь дольше течёт и перераспределяет
+    P[None].plastFlow = 1.6     # скорость течения (ещё быстрее), самоперераспределение успевает
+    P[None].creepRecover = 0.6  # медленнее залечивание: накопленный крип дольше держится,
+                                # без резких скачков, и трещина растёт равномерно
 
 
 def apply_water(head_m):
-    P[None].kw = 2000.0
+    P[None].kw = WSPR
     P[None].wCap = WPRESS * head_m
     P[None].head = head_m
-
-# ------------------------------------------------------------------ параметры
-@ti.dataclass
-class Params:
-    g: ti.f32
-    kn: ti.f32
-    cn: ti.f32
-    mu: ti.f32
-    kts: ti.f32
-    kb: ti.f32
-    ks: ti.f32
-    rp: ti.f32
-    ftScale: ti.f32
-    rcFactor: ti.f32
-    fsFactor: ti.f32
-    kw: ti.f32
-    wCap: ti.f32
-    fixedRows: ti.i32
-    walls: ti.i32
-    substeps: ti.i32
-    depth: ti.f32
-    head: ti.f32
-    k0: ti.f32
-    relBend: ti.f32
-    dmgMax: ti.f32
-    dmgDecay: ti.f32
-    brkCap: ti.i32
-    cnc: ti.f32   # демпфирование КОНТАКТА блоков (отдельно от связей) — гасит подпрыгивание обломков
-    maxSize: ti.i32   # максимальный размер блока в модели (радиус поиска соседей)
-
-
-P = Params.field(shape=())
-
-# ------------------------------------------------------------------ поля блоков
-bx = ti.field(ti.f32, MAXB)
-by = ti.field(ti.f32, MAXB)
-bvx = ti.field(ti.f32, MAXB)
-bvy = ti.field(ti.f32, MAXB)
-bfx = ti.field(ti.f32, MAXB)
-bfy = ti.field(ti.f32, MAXB)
-wfx = ti.field(ti.f32, MAXB)
-wfy = ti.field(ti.f32, MAXB)
-ovf = ti.field(ti.f32, MAXB)
-bfixed = ti.field(ti.i32, MAXB)
-bshade = ti.field(ti.f32, MAXB)
-bstress = ti.field(ti.f32, MAXB)
-bstressC = ti.field(ti.f32, MAXB)
-brot = ti.field(ti.f32, MAXB)
-bw = ti.field(ti.f32, MAXB)
-btor = ti.field(ti.f32, MAXB)
-nbond = ti.field(ti.i32, MAXB)
-bsz = ti.field(ti.f32, MAXB)     # размер блока (сторона квадрата), клетки
-hx = ti.field(ti.f32, MAXB)      # начальная позиция (для диагностики смещения)
-hy = ti.field(ti.f32, MAXB)
-bcount = ti.field(ti.i32, shape=())
-
-# сетка верхней нагрузки (только по колонкам)
-topYArr = ti.field(ti.f32, COLS)
-topCol = ti.field(ti.i32, COLS)
-# индекс досыпанного за текущий тик обломка для каждой колонки (-1 = нет),
-# чтобы связывать между собой только НОВЫЕ обломки (не со старым массивом)
-newRubble = ti.field(ti.i32, COLS)
-
-# топология массива: занятость клетки блоком + вертикальная перегрузка (сверху вниз)
-gOcc = ti.field(ti.i32, N)
-sigVI = ti.field(ti.f32, N)
-# горизонтальное удержание: holdL — давление, удерживающее блок слева (σ_h от левого
-# соседа), holdR — справа. Равновесие: holdL == holdR (сумма проекций = 0).
-holdL = ti.field(ti.f32, N)
-holdR = ti.field(ti.f32, N)
-
-# связи (bonds) — фиксированные массивы, длина покоя и направление у каждой
-bondA = ti.field(ti.i32, MAXBONDS)
-bondB = ti.field(ti.i32, MAXBONDS)
-bondIntact = ti.field(ti.i32, MAXBONDS)
-bondDmg = ti.field(ti.f32, MAXBONDS)
-bondR = ti.field(ti.f32, MAXBONDS)
-bondJ = ti.field(ti.f32, MAXBONDS)
-brest = ti.field(ti.f32, MAXBONDS)      # длина покоя связи
-bondNX = ti.field(ti.f32, MAXBONDS)     # начальное направление связи (единичный вектор)
-bondNY = ti.field(ti.f32, MAXBONDS)
-bondE = ti.field(ti.f32, MAXBONDS)   # накопленная упругая энергия связи
-bondCount = ti.field(ti.i32, shape=())
-# наличие связи между парой блоков — битовая карта (вместо сеточной is_bonded):
-# bondMap[a, b>>5] хранит бит b&31. Перестраивается в count_bonds каждый кадр.
-bondMap = ti.field(ti.i32, (MAXB, BMAPW))
-
-# контактный хэш блоков
-hhead = ti.field(ti.i32, N)
-hnext = ti.field(ti.i32, MAXB)
-
-# трение по парам (постоянно между кадрами) — open-addressing хэш вместо MAXB² (16M)
-FRIC_SLOTS = 16384   # степень двойки
-FRIC_MASK = FRIC_SLOTS - 1
-fricKey = ti.field(ti.i32, FRIC_SLOTS)
-fricS = ti.field(ti.f32, FRIC_SLOTS)
-fricF = ti.field(ti.f32, FRIC_SLOTS)   # момент последнего контакта (simT, с)
-
-simT = ti.field(ti.f32, shape=())       # внутреннее время симуляции, с (не зависит от кадров)
-compactT = ti.field(ti.f32, shape=())   # simT последней пересборки связей, с
-loadCur = ti.field(ti.f32, shape=())
-broken = ti.field(ti.i32, shape=())
-frameBrk = ti.field(ti.i32, shape=())
-breakCrush = ti.field(ti.i32, shape=())
-dmax = ti.field(ti.f32, shape=())
-
-# ------------------------------------------------------------------ флюид
-wx = ti.field(ti.f32, MAXP)
-wy = ti.field(ti.f32, MAXP)
-wpx = ti.field(ti.f32, MAXP)
-wpy = ti.field(ti.f32, MAXP)
-wvx = ti.field(ti.f32, MAXP)
-wvy = ti.field(ti.f32, MAXP)
-corrX = ti.field(ti.f32, MAXP)
-corrY = ti.field(ti.f32, MAXP)
-fx0 = ti.field(ti.f32, MAXP)
-fy0 = ti.field(ti.f32, MAXP)
-pCount = ti.field(ti.i32, shape=())
-fhead = ti.field(ti.i32, N)
-fnxt = ti.field(ti.i32, MAXP)
-# буфер перекрывающихся блоков для collide_water (одна частица -> до MAXNB блоков)
-cwB = ti.field(ti.i32, (MAXP, MAXNB))
-cwDx = ti.field(ti.f32, (MAXP, MAXNB))
-cwDy = ti.field(ti.f32, (MAXP, MAXNB))
-cwR = ti.field(ti.f32, (MAXP, MAXNB))    # порог контакта каждого блока (bsz/2 + RP_SPH)
-fwg = ti.field(ti.f32, shape=())
-capWarned = ti.field(ti.i32, shape=())
-
-# источники воды
-srcX = ti.field(ti.f32, MAXSRC)
-srcY = ti.field(ti.f32, MAXSRC)
-srcPh = ti.field(ti.f32, MAXSRC)
-srcCount = ti.field(ti.i32, shape=())
-
-# пыль (осколки при разрыве связи)
-dustX = ti.field(ti.f32, MAXDUST)
-dustY = ti.field(ti.f32, MAXDUST)
-dustVX = ti.field(ti.f32, MAXDUST)
-dustVY = ti.field(ti.f32, MAXDUST)
-dustLife = ti.field(ti.f32, MAXDUST)
-dustCol = ti.field(ti.i32, MAXDUST)
-dustCount = ti.field(ti.i32, shape=())
-
-# полость выработки (для диагностики заполнения водой)
-cavX = ti.field(ti.f32, shape=())
-cavY = ti.field(ti.f32, shape=())
-cavRX = ti.field(ti.f32, shape=())
-cavRY = ti.field(ti.f32, shape=())
-filledFlag = ti.field(ti.i32, shape=())
-
-# ------------------------------------------------------------------ вспомогательное
-@ti.func
-def bkey(a: ti.i32, b: ti.i32) -> ti.i32:
-    lo = ti.min(a, b)
-    hi = ti.max(a, b)
-    return lo * MAXB + hi
-
-
-@ti.func
-def clamp_cell(x: ti.f32) -> ti.i32:
-    c = int(x)
-    if c < 0:
-        c = 0
-    elif c >= COLS:
-        c = COLS - 1
-    return c
-
-
-@ti.func
-def row_cell(y: ti.f32) -> ti.i32:
-    c = int(y)
-    if c < 0:
-        c = 0
-    elif c >= ROWS:
-        c = ROWS - 1
-    return c
-
-
-@ti.func
-def occ_at(x: ti.f32, y: ti.f32) -> ti.i32:
-    """Занята ли клетка (x, y) блоком (1 = есть блок, 0 = пусто/выработка)."""
-    return gOcc[row_cell(y) * COLS + clamp_cell(x)]
-
-
 @ti.kernel
-def refresh_field():
-    """Пересчитать топологию и поля напряжений.
-
-    1) Занятость клеток блоком — по текущим позициям (без геометрии полости).
-    2) Вертикальная перегрузка в каждой занятой клетке: нагрузка от поверхности
-       + вес всего столба блоков НАД ней (сверху вниз).
-    3) Горизонтальное удержание двумя встречными проходами (сверху вниз):
-       блок держится слева/справа с давлением σ_h = K0·σ_v, ЕСЛИ сосед есть;
-       у свободной грани (выработка) с этой стороны удержания нет.
-    """
-    for c in range(N):
-        gOcc[c] = 0
-        sigVI[c] = 0.0
-        holdL[c] = 0.0
-        holdR[c] = 0.0
-    for i in range(bcount[None]):
-        cxi = clamp_cell(bx[i])
-        cyi = row_cell(by[i])
-        gOcc[cyi * COLS + cxi] = 1
-    for x in range(COLS):
-        carry = loadCur[None]
-        y = 0
-        while y < ROWS:
-            c = y * COLS + x
-            if gOcc[c] == 1:
-                sigVI[c] = carry
-                carry += P[None].g
-            y += 1
-    for y in range(ROWS):
-        # слева-направо: удержание справа (σ_h от правого соседа)
-        for x in range(COLS):
-            c = y * COLS + x
-            if gOcc[c] == 1 and x + 1 < COLS and gOcc[y * COLS + x + 1] == 1:
-                holdR[c] = sigVI[c] * P[None].k0
-        # справа-налево: удержание слева (σ_h от левого соседа)
-        for j in range(COLS):
-            x = COLS - 1 - j
-            c = y * COLS + x
-            if gOcc[c] == 1 and x - 1 >= 0 and gOcc[y * COLS + x - 1] == 1:
-                holdL[c] = sigVI[c] * P[None].k0
-
-
-@ti.func
-def init_block(i: ti.i32, x: ti.f32, y: ti.f32, size: ti.f32, fixed: ti.i32):
-    bx[i] = x
-    by[i] = y
-    bvx[i] = 0.0
-    bvy[i] = 0.0
-    bfx[i] = 0.0
-    bfy[i] = 0.0
-    wfx[i] = 0.0
-    wfy[i] = 0.0
-    ovf[i] = 0.0
-    bfixed[i] = fixed
-    bshade[i] = ti.random()
-    bstress[i] = 0.0
-    bstressC[i] = 0.0
-    brot[i] = 0.0
-    bw[i] = 0.0
-    btor[i] = 0.0
-    nbond[i] = 0
-    bsz[i] = size
-    hx[i] = x
-    hy[i] = y
-
-
-@ti.func
-def add_block_func(x: ti.f32, y: ti.f32, size: ti.f32, fixed: ti.i32) -> ti.i32:
-    """Добавить блок произвольного размера в произвольной точке. Возвращает индекс или -1.
-
-    Выделение слота происходит неатомарно (один поток), поэтому вызов применим
-    из последовательных контекстов (gen_tunnel, инструменты). Для массовой
-    параллельной загрузки используйте _load_blocks (детерминированный слот i==k)."""
-    res = -1
-    if bcount[None] < MAXB:
-        i = bcount[None]
-        init_block(i, x, y, size, fixed)
-        bcount[None] += 1
-        res = i
-    return res
-
-
-@ti.func
-def add_bond_func(a: ti.i32, b: ti.i32, rest: ti.f32, intact: ti.i32):
-    """Связать блоки a и b с длиной покоя rest (по умолчанию — текущее расстояние)."""
-    if bondCount[None] < MAXBONDS:
-        i = ti.atomic_add(bondCount[None], 1)
-        bondA[i] = a
-        bondB[i] = b
-        bondIntact[i] = intact
-        bondDmg[i] = 0.0
-        bondR[i] = 0.0
-        bondJ[i] = (ti.random() - 0.5) * 0.3
-        brest[i] = rest
-        dx = bx[b] - bx[a]
-        dy = by[b] - by[a]
-        d = ti.sqrt(dx * dx + dy * dy)
-        if d < 1e-9:
-            bondNX[i] = 1.0
-            bondNY[i] = 0.0
-        else:
-            bondNX[i] = dx / d
-            bondNY[i] = dy / d
-        bondE[i] = 0.0
-
-
-@ti.func
-def set_bond_bit(a: ti.i32, b: ti.i32):
-    ti.atomic_or(bondMap[a, b >> 5], 1 << (b & 31))
-    ti.atomic_or(bondMap[b, a >> 5], 1 << (a & 31))
-
-
-@ti.func
-def clear_bond_bit(a: ti.i32, b: ti.i32):
-    ti.atomic_and(bondMap[a, b >> 5], ~(1 << (b & 31)))
-    ti.atomic_and(bondMap[b, a >> 5], ~(1 << (a & 31)))
-
-
-@ti.func
-def is_bonded_bit(a: ti.i32, b: ti.i32) -> ti.i32:
-    return (bondMap[a, b >> 5] >> (b & 31)) & 1
-
-
-@ti.func
-def remove_block_func(rem: ti.i32):
-    """Удалить блок: связи с ним умирают, последний блок переносится на его место."""
-    i = 0
-    while i < bondCount[None]:
-        a = bondA[i]
-        b = bondB[i]
-        if a == rem or b == rem:
-            bondIntact[i] = 0
-            clear_bond_bit(a, b)
-        i += 1
-    last = bcount[None] - 1
-    if rem != last:
-        bx[rem] = bx[last]
-        by[rem] = by[last]
-        bvx[rem] = bvx[last]
-        bvy[rem] = bvy[last]
-        bfx[rem] = bfx[last]
-        bfy[rem] = bfy[last]
-        wfx[rem] = wfx[last]
-        wfy[rem] = wfy[last]
-        ovf[rem] = ovf[last]
-        bfixed[rem] = bfixed[last]
-        bshade[rem] = bshade[last]
-        bstress[rem] = bstress[last]
-        bstressC[rem] = bstressC[last]
-        brot[rem] = brot[last]
-        bw[rem] = bw[last]
-        btor[rem] = btor[last]
-        nbond[rem] = nbond[last]
-        bsz[rem] = bsz[last]
-        hx[rem] = hx[last]
-        hy[rem] = hy[last]
-        i = 0
-        while i < bondCount[None]:
-            if bondIntact[i] == 1:
-                a = bondA[i]
-                b = bondB[i]
-                if a == last:
-                    bondA[i] = rem
-                elif b == last:
-                    bondB[i] = rem
-            i += 1
-    bcount[None] -= 1
-
-
-@ti.kernel
-def compact_bonds():
-    n = 0
-    i = 0
-    while i < bondCount[None]:
-        a = bondA[i]
-        b = bondB[i]
-        if bondIntact[i] == 1:
-            bondA[n] = a
-            bondB[n] = b
-            bondIntact[n] = 1
-            bondR[n] = bondR[i]
-            bondDmg[n] = bondDmg[i]
-            bondJ[n] = bondJ[i]
-            brest[n] = brest[i]
-            bondNX[n] = bondNX[i]
-            bondNY[n] = bondNY[i]
-            bondE[n] = bondE[i]
-            n += 1
-        i += 1
-    bondCount[None] = n
-
-
-@ti.func
-def spawn_particle(x: ti.f32, y: ti.f32, vm: ti.f32, a0: ti.f32):
-    if pCount[None] < PMAX:
-        i = pCount[None]
-        pCount[None] += 1
-        wx[i] = x + (ti.random() - 0.5) * 0.35
-        wy[i] = y + (ti.random() - 0.5) * 0.35
-        wpx[i] = wx[i]
-        wpy[i] = wy[i]
-        a = a0 + (ti.random() - 0.5) * 0.6
-        v = vm * (0.6 + 0.4 * ti.random())
-        wvx[i] = ti.cos(a) * v
-        wvy[i] = ti.sin(a) * v
-    else:
-        capWarned[None] = 1
-
-
-@ti.func
-def kill_particle(i: ti.i32):
-    last = pCount[None] - 1
-    wx[i] = wx[last]
-    wy[i] = wy[last]
-    wpx[i] = wpx[last]
-    wpy[i] = wpy[last]
-    wvx[i] = wvx[last]
-    wvy[i] = wvy[last]
-    pCount[None] -= 1
-
-
-@ti.func
-def break_event(a: ti.i32, b: ti.i32, crush: ti.i32):
-    ti.atomic_add(broken[None], 1)
-    breakCrush[None] = crush
-    d = ti.atomic_add(dustCount[None], 1)
-    if d < MAXDUST:
-        dustX[d] = (bx[a] + bx[b]) * 0.5
-        dustY[d] = (by[a] + by[b]) * 0.5
-        dustVX[d] = (ti.random() - 0.5) * 0.1
-        dustVY[d] = (ti.random() - 0.5) * 0.1
-        dustLife[d] = 1.0
-        dustCol[d] = 1 if crush == 1 else 0
-
-
-@ti.func
-def try_fracture(bd: ti.i32, a: ti.i32, b: ti.i32, crush: ti.i32) -> ti.i32:
-    """Разрушение с накоплением повреждений (rate-limited).
-
-    Лимит разрывов за кадр (brkCap) не даёт лавине порваться вся сразу:
-    сверх лимита связи накапливают 'повреждение' и рвутся только при
-    удержании перегрузки несколько кадров подряд. Локальная перегрузка
-    успевает перераспределиться, и каскадное обрушение затухает."""
-    ok = 0
-    if ti.atomic_add(frameBrk[None], 1) < P[None].brkCap:
-        bondDmg[bd] = P[None].dmgMax
-        ok = 1
-    else:
-        bondDmg[bd] += 1.0
-        if bondDmg[bd] >= P[None].dmgMax:
-            ok = 1
-    return ok
-
-
-@ti.kernel
-def decay_bond_damage():
-    """Сглаживание повреждений между кадрами: мгновенный перегрузка спадает,
-    разрушение требует длительного УДЕРЖАНИЯ перегрузки (скорость роста трещины)."""
-    for bd in range(bondCount[None]):
-        if bondIntact[bd] == 1 and bondDmg[bd] > 0.0:
-            bondDmg[bd] *= P[None].dmgDecay
-
-
-@ti.func
-def fracture_bond(bd: ti.i32, a: ti.i32, b: ti.i32, crush: ti.i32,
-                  strain: ti.f32, shear: ti.f32, relb: ti.f32):
-    """Разрыв связи: вся накопленная упругая энергия bondE[bd]
-    одномоментно переходит в кинетическую энергию осколков.
-    Направление — по оси связи (нормаль) + касательная (сдвиг)."""
-    bondIntact[bd] = 0
-    clear_bond_bit(a, b)
-    break_event(a, b, crush)
-
-    # --- направление связи ---
-    dx = bx[b] - bx[a]
-    dy = by[b] - by[a]
-    d = ti.sqrt(dx * dx + dy * dy)
-    ux = 1.0
-    uy = 0.0
-    if d > 1e-9:
-        ux = dx / d
-        uy = dy / d
-    else:
-        ux = bondNX[bd]
-        uy = bondNY[bd]
-    px = -uy
-    py = ux
-
-    # --- энергетически корректный пинок ---
-    E_acc = bondE[bd]          # вся накопленная энергия
-    bondE[bd] = 0.0
-
-    if crush == 1:
-        pass
-    else:
-        # Приведённая масса из реальных размеров блоков (m ∝ площади, толщина = 1):
-        ma = bsz[a] * bsz[a]
-        mb = bsz[b] * bsz[b]
-        mred = ma * mb / (ma + mb + 1e-9)
-        # В хрупком разрушении почти вся энергия уходит в поверхность/тепло:
-        # в кинетическую уходит малая доля (eta = 3%).
-        eta = 0.03
-        E_kin = E_acc * eta
-        dv = ti.sqrt(2.0 * E_kin / mred)
-
-        dv_n = dv * 0.7
-        dv_s = dv * 0.3
-
-        sgn_n = 1.0 if strain > 0.0 else -1.0
-        bvx[a] -= ux * sgn_n * dv_n * 0.5
-        bvy[a] -= uy * sgn_n * dv_n * 0.5
-        bvx[b] += ux * sgn_n * dv_n * 0.5
-        bvy[b] += uy * sgn_n * dv_n * 0.5
-
-        sgn_s = 1.0 if shear > 0.0 else -1.0
-        bvx[a] -= px * sgn_s * dv_s * 0.5
-        bvy[a] -= py * sgn_s * dv_s * 0.5
-        bvx[b] += px * sgn_s * dv_s * 0.5
-        bvy[b] += py * sgn_s * dv_s * 0.5
-
-        if ti.abs(relb) > 1e-6:
-            Ia = bsz[a] * bsz[a] / 6.0
-            Ib = bsz[b] * bsz[b] / 6.0
-            Ired = Ia * Ib / (Ia + Ib + 1e-9)
-            E_rot = E_acc * 0.15
-            dw = ti.sqrt(2.0 * E_rot / Ired)
-            sgr = 1.0 if relb > 0.0 else -1.0
-            bw[a] -= sgr * dw * 0.5
-            bw[b] += sgr * dw * 0.5
-
-
-@ti.func
-def fric_slot(key: ti.i32) -> ti.i32:
-    """Найти или создать слот для пары блоков. -1 если хэш переполнен."""
-    h = key ^ (key >> 12)
-    h = h ^ (h >> 6)
-    h = h & FRIC_MASK
-    s = h
-    res = -1
-    guard = 0
-    while guard < FRIC_SLOTS:
-        if res >= 0:
-            break
-        k = fricKey[s]
-        if k == key:
-            res = s
-        elif k == -1:
-            fricKey[s] = key
-            fricS[s] = 0.0
-            fricF[s] = 0
-            res = s
-        else:
-            s = (s + 1) & FRIC_MASK
-        guard += 1
-    return res
-
-
-@ti.func
-def friction_apply(i: ti.i32, j: ti.i32, key: ti.i32, vt: ti.f32, Fn: ti.f32, dt: ti.f32, axis: ti.i32,
-                   sx: ti.f32, sy: ti.f32):
-    s = fric_slot(key)
-    if s >= 0:
-        e_s = fricS[s]
-        e_f = fricF[s]
-        if simT[None] - e_f > FRIC_FORGET_T:
-            e_s = 0.0
-        else:
-            e_s *= 0.5
-        fricF[s] = simT[None]
-        e_s += vt * dt
-        Ft = -P[None].kts * e_s
-        Fm = P[None].mu * Fn
-        if Ft > Fm:
-            Ft = Fm
-        elif Ft < -Fm:
-            Ft = -Fm
-        fricS[s] = -Ft / P[None].kts
-        if axis == 1:
-            ti.atomic_add(bfy[i], -Ft)
-            ti.atomic_add(bfy[j], Ft)
-            if nbond[i] == 0:
-                ti.atomic_add(btor[i], -Ft * sx * 0.9)
-            if nbond[j] == 0:
-                ti.atomic_add(btor[j], -Ft * sx * 0.9)
-        else:
-            ti.atomic_add(bfx[i], -Ft)
-            ti.atomic_add(bfx[j], Ft)
-            if nbond[i] == 0:
-                ti.atomic_add(btor[i], Ft * sy * 0.9)
-            if nbond[j] == 0:
-                ti.atomic_add(btor[j], Ft * sy * 0.9)
-
-
-# ================================================================== DEM физика
-@ti.kernel
-def phys_reset():
-    g = P[None].g
-    for i in range(bcount[None]):
-        bfx[i] = wfx[i]
-        btor[i] = 0.0
-        if bfixed[i] == 1:
-            bfy[i] = wfy[i] + ovf[i]
-        else:
-            bfy[i] = wfy[i] + ovf[i] + g
-    # боковое горное давление (схема сверху-вниз, см. refresh_field):
-    # σ_h = K0·σ_v давит на блок ТОЛЬКО в сторону реально свободной грани
-    # (пустая соседняя клетка). Внутри массива свободных граней нет — сумма
-    # проекций = 0, блок в равновесии. Детекция свободной грани — относительно
-    # САМОГО блока (±1 клетка по occ_at), а не через клеточное поле holdL/holdR,
-    # чтобы блок не дрожал при пересечении границ клеток.
-    # Распор действует и на ОБРУШЕННУЮ породу (обломки) — у неё тоже есть боковое
-    # давление, но меньшее (K0_RUBBLE), чем у нетронутого массива. Давление обломков
-    # на соседние обломки и на массив передаётся контактными силами (phys_contact).
-    # В открытой пустоте у блока обе стороны пусты -> силы влево/вправо равны и
-    # гасятся (нет нетто-силы) — летящий обломок не дёргается.
-    for i in range(bcount[None]):
-        if bfixed[i] == 1:
-            continue
-        sv = sigVI[row_cell(by[i]) * COLS + clamp_cell(bx[i])]
-        coef = P[None].k0 if nbond[i] > 0 else K0_RUBBLE
-        th = sv * coef * 0.5
-        push = 0.0
-        if occ_at(bx[i] - 1.0, by[i]) == 0:
-            push -= th
-        if occ_at(bx[i] + 1.0, by[i]) == 0:
-            push += th
-        # Боковое давление — чисто горизонтальная сила. Вертикальная составляющая
-        # должна возникать только через контакты и связи; добавление bfy здесь создаёт
-        # положительную обратную связь (push -> придавливание вниз -> рост sigVI -> ...)
-        # и каскадное обрушение. Поэтому bfy НЕ трогаем.
-        if ti.abs(push) > 1e-9:
-            ti.atomic_add(bfx[i], push)
-
-
-@ti.kernel
-def phys_bonds(dt: ti.f32):
-    Ftmax = P[None].rp * P[None].ftScale
-    Fcmax = Ftmax * P[None].rcFactor
-    Fsmax = Ftmax * P[None].fsFactor
-    kb = P[None].kb
-    cn = P[None].cn
-    ks = P[None].ks
-    for bd in range(bondCount[None]):
-        a = bondA[bd]
-        b = bondB[bd]
-        dx = bx[b] - bx[a]
-        dy = by[b] - by[a]
-        d = ti.sqrt(dx * dx + dy * dy)
-        # боковое давление на свободных гранях (σ_h = K0·σ_v) считается в phys_reset
-        # для каждого блока отдельно — см. там.
-        if bondIntact[bd] == 0:
-            continue
-        if d < 1e-9:
-            continue
-        ux = dx / d
-        uy = dy / d
-        rvx = bvx[b] - bvx[a]
-        rvy = bvy[b] - bvy[a]
-        vn = rvx * ux + rvy * uy
-        strain = d - brest[bd]
-        Fn = -kb * strain - cn * vn
-        tension = kb * strain
-        # сдвиг поперёк начального направления связи
-        px = -bondNY[bd]
-        py = bondNX[bd]
-        off = (dx - brest[bd] * bondNX[bd]) * px + (dy - brest[bd] * bondNY[bd]) * py
-        vs = rvx * px + rvy * py
-        Fs = -ks * off - cn * vs
-        shearF = ks * off
-        rel = brot[b] - brot[a]
-        rw = bw[b] - bw[a]
-        krot = kb * 0.02
-        Fx = Fn * ux + Fs * px
-        Fy = Fn * uy + Fs * py
-        # Накопление упругой энергии за подшаг:
-        # E += ½·k·u² · dt  (нормаль + сдвиг + изгиб) ИЗМ
-        bondE[bd] = 0.5 * kb * strain * strain + 0.5 * ks * off * off + 0.5 * krot * rel * rel
-        ti.atomic_add(bfx[b], Fx)
-        ti.atomic_add(bfy[b], Fy)
-        ti.atomic_add(bfx[a], -Fx)
-        ti.atomic_add(bfy[a], -Fy)
-        tor = -krot * rel - cn * 5.0 * rw
-        ti.atomic_add(btor[a], tor)
-        ti.atomic_add(btor[b], -tor)
-        if tension > 0.0:
-            r = tension / Ftmax
-            bondR[bd] = r
-            ti.atomic_max(bstress[a], r)
-            ti.atomic_max(bstress[b], r)
-            if tension > Ftmax or tension > kb * 0.12:
-                if try_fracture(bd, a, b, 0):
-                    fracture_bond(bd, a, b, 0, strain, off, rel)
-        else:
-            bondR[bd] = tension / (Fcmax * 0.25)
-            c = -tension / Fcmax
-            ti.atomic_max(bstressC[a], c)
-            ti.atomic_max(bstressC[b], c)
-            if -tension > Fcmax:
-                if try_fracture(bd, a, b, 1):
-                    fracture_bond(bd, a, b, 1, strain, off, rel)
-            elif ti.abs(shearF) > Fsmax:
-                if try_fracture(bd, a, b, 0):
-                    fracture_bond(bd, a, b, 0, strain, off, rel)
-            elif ti.abs(rel) > P[None].relBend:
-                if try_fracture(bd, a, b, 0):
-                    fracture_bond(bd, a, b, 0, strain, off, rel)
-
-
-@ti.kernel
-def phys_contact(dt: ti.f32):
-    kn = P[None].kn
-    cn = P[None].cnc   # контактное демпфирование (отдельное от связей, почти критическое)
-    RR = P[None].maxSize   # радиус поиска соседей в клетках (по макс. размеру блока)
-    for i in range(bcount[None]):
-        cxi = clamp_cell(bx[i])
-        cyi = clamp_cell(by[i])
-        ri = bsz[i] * 0.5
-        for oy in range(-MAXNBR, MAXNBR + 1):
-            if oy > RR or oy < -RR:
-                continue
-            yy = cyi + oy
-            if yy >= 0 and yy < ROWS:
-                for ox in range(-MAXNBR, MAXNBR + 1):
-                    if ox > RR or ox < -RR:
-                        continue
-                    xx = cxi + ox
-                    if xx >= 0 and xx < COLS:
-                        j = hhead[yy * COLS + xx]
-                        while j != -1:
-                            if j > i:
-                                if not (bfixed[i] == 1 and bfixed[j] == 1):
-                                    key = bkey(i, j)
-                                    if is_bonded_bit(i, j) == 0:
-                                        dx = bx[j] - bx[i]
-                                        dy = by[j] - by[i]
-                                        rj = bsz[j] * 0.5
-                                        rs = ri + rj
-                                        axx = ti.abs(dx)
-                                        ayy = ti.abs(dy)
-                                        oxx = rs - axx
-                                        oyy = rs - ayy
-                                        if oxx > 0.0 and oyy > 0.0:
-                                            if oxx < oyy:
-                                                s = 1.0 if dx > 0.0 else -1.0
-                                                vsep = (bvx[j] - bvx[i]) * s
-                                                Fn = kn * oxx - cn * vsep
-                                                if Fn < 0.0:
-                                                    Fn = 0.0
-                                                ti.atomic_add(bfx[i], -Fn * s)
-                                                ti.atomic_add(bfx[j], Fn * s)
-                                                tau = -cn * vsep * s * dy * 0.8
-                                                if nbond[i] == 0:
-                                                    ti.atomic_add(btor[i], tau)
-                                                if nbond[j] == 0:
-                                                    ti.atomic_add(btor[j], tau)
-                                                friction_apply(i, j, key, bvy[j] - bvy[i], Fn, dt, 1, s, 0.0)
-                                            else:
-                                                s = 1.0 if dy > 0.0 else -1.0
-                                                vsep = (bvy[j] - bvy[i]) * s
-                                                Fn = kn * oyy - cn * vsep
-                                                if Fn < 0.0:
-                                                    Fn = 0.0
-                                                ti.atomic_add(bfy[i], -Fn * s)
-                                                ti.atomic_add(bfy[j], Fn * s)
-                                                tau = cn * vsep * s * dx * 0.8
-                                                if nbond[i] == 0:
-                                                    ti.atomic_add(btor[i], tau)
-                                                if nbond[j] == 0:
-                                                    ti.atomic_add(btor[j], tau)
-                                                friction_apply(i, j, key, bvx[j] - bvx[i], Fn, dt, 0, 0.0, s)
-                            j = hnext[j]
-
-
-@ti.kernel
-def phys_integrate(dt: ti.f32):
+def phys_integrate(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32, drotBond: ti.f32):
     walls = P[None].walls
     for i in range(bcount[None]):
         if bfixed[i] == 1:
@@ -946,25 +96,46 @@ def phys_integrate(dt: ti.f32):
             bvy[i] = 0.0
             bw[i] = 0.0
             continue
-        ri = bsz[i] * 0.5
-        bvx[i] += bfx[i] * dt
-        bvy[i] += bfy[i] * dt
+        rx = block_prj(i)   # проекция повёрнутого квадрата: угол достигает пола/стен раньше круга
+        # --- трение свободных блоков о жёсткие границы домена (пол/стены) ---
+        # У обломка, лежащего прямо на дне, нет блока-соседа снизу, поэтому пара
+        # (friction_apply) к нему не применяется; без этого пол — идеально гладкий,
+        # и свободные обломки беспрепятственно раскатываются по поверхности.
+        # Нормаль = собственный вес + вес столба над ним (sigVI — Н на клетку).
+        kfric = P[None].E
+        nF = bmass[i] * P[None].g + sigVI[row_cell(by[i]) * COLS + clamp_cell(bx[i])]
+        if nF < bmass[i] * P[None].g:
+            nF = bmass[i] * P[None].g
+        if by[i] <= rx + 0.02 * LCELL or by[i] >= (ROWS * LCELL - rx - 0.02 * LCELL):
+            friction_against(i, bvx[i], nF, dt, -(i + 1), kfric, 0)
+        if walls == 1:
+            if bx[i] <= rx + 0.02 * LCELL or bx[i] >= (COLS * LCELL - rx - 0.02 * LCELL):
+                friction_against(i, bvy[i], nF, dt, -(i + 1) - FRIC_SLOTS, kfric, 1)
+        bvx[i] += bfx[i] / bmass[i] * dt
+        bvy[i] += bfy[i] / bmass[i] * dt
         # Связанные и опирающиеся блоки гасятся сильно (устойчивость массива,
-        # оседание обломков). Блок, летящий в пустоте — связей нет и снизу пустая
-        # клетка — почти не гасится: обрушение выходит динамичным, а не "вязким".
-        # Как только блок садится на опору, демпфирование возвращается.
-        if nbond[i] == 0 and occ_at(bx[i], by[i] + 1.0) == 0:
-            bvx[i] *= 0.9995
-            bvy[i] *= 0.9995
+        # оседание обломков). Блок, летящий в пустоте — связей нет и снизу нет опоры
+        # (supp==0, геометрия из phys_contact) — почти не гасится: обрушение выходит
+        # динамичным, а не "вязким". Как только блок садится на опору, демпфирование
+        # возвращается.
+        # dfree/dsupp/drot* — множители демпфирования ЗА ПОДШАГ: базовые константы
+        # (DAMP_*_TICK) задуманы на тик, но здесь применяются SUBSTEPS раз за тик,
+        # поэтому шагом раньше пересчитаны как base^(dt/TICK). Иначе 192-кратное
+        # применение давало бы v *= 0.9995^192 ≈ 0.908 за тик и искусственную
+        # терминальную скорость падения ~3.4 клетки/с вместо реального свободного
+        # падения (обломки "ползли" вниз много секунд).
+        if nbond[i] == 0 and supp[i] == 0:
+            bvx[i] *= dfree
+            bvy[i] *= dfree
         else:
-            bvx[i] *= 0.9975
-            bvy[i] *= 0.9975
-        bw[i] += btor[i] * 1.0 * dt
+            bvx[i] *= dsupp
+            bvy[i] *= dsupp
+        bw[i] += btor[i] / (bmass[i] * bsz[i] * bsz[i] / 6.0) * dt
         if nbond[i] > 0:
-            bw[i] *= 0.97
+            bw[i] *= drotBond
         else:
-            bw[i] *= 0.992
-        if ti.abs(bw[i]) < 2e-4:
+            bw[i] *= drotFree
+        if ti.abs(bw[i]) < 2e-5:
             bw[i] = 0.0
         if bw[i] > 10.0:
             bw[i] = 10.0
@@ -972,15 +143,24 @@ def phys_integrate(dt: ti.f32):
             bw[i] = -10.0
         brot[i] += bw[i] * dt
         v2 = bvx[i] * bvx[i] + bvy[i] * bvy[i]
-        if v2 > 900.0:
-            s = 30.0 / ti.sqrt(v2)
+        if v2 > VMAX * VMAX:
+            s = VMAX / ti.sqrt(v2)
             bvx[i] *= s
             bvy[i] *= s
-        elif v2 < SLEEP_V2 and occ_at(bx[i], by[i] + 1.0) == 1:
-            # блок почти стоит, силы уравновешены И снизу есть опора (клетка занята).
-            # Условие опоры не даёт заморозить оторвавшийся/зажатый блок, под которым
-            # пустота: такой блок продолжает падать и не "садится на место".
-            if bfx[i] * bfx[i] + bfy[i] * bfy[i] < SLEEP_A2:
+        elif v2 < SLEEP_V2 and comIn[i] == 1:
+            # блок почти стоит, силы уравновешены И он УСТОЙЧИВ: проекция ЦТ попадает
+            # в интервал реальной опоры (comIn из phys_contact — точки контакта снизу,
+            # size-aware) или блок лежит на полу.
+            # Блок, висящий НА КРАЮ опоры (comIn==0), не засыпает: момент от
+            # эксцентриситета веса продолжает его опрокидывать — кривые "пружинящие"
+            # столбы из блоков больше не замерзают в равновесии, которого нет.
+            ax = bfx[i] / bmass[i]
+            ay = bfy[i] / bmass[i]
+            # момент перекоса (блок на краю опоры: линейные силы в равновесии, но
+            # момент от Fn≠CM крутит его) не даём "уснуть" — иначе валежник навсегда
+            # застревает на краю блока и не опрокидывается/не съезжает.
+            angA = btor[i] / (bmass[i] * bsz[i] * bsz[i] / 6.0)
+            if ax * ax + ay * ay < SLEEP_A2 and angA * angA < SLEEP_A2:
                 bvx[i] = 0.0
                 bvy[i] = 0.0
                 bw[i] = 0.0
@@ -990,32 +170,32 @@ def phys_integrate(dt: ti.f32):
         # скорости: скорость в стенку гасится экспоненциально (v *= 1 - cnc·dt),
         # энергия не отражается обратно в модель, осцилляций на границе нет.
         # Позиция всё равно клампится в домен, так что блок не вылетает.
-        damp = P[None].cnc * dt
+        damp = 2.0 * P[None].cnc * dt * ti.sqrt(P[None].E / bmass[i])
         if damp > 1.0:
             damp = 1.0
         if walls == 1:
-            if bx[i] < ri:
-                bx[i] = ri
+            if bx[i] < rx:
+                bx[i] = rx
                 if bvx[i] < 0.0:
                     bvx[i] *= 1.0 - damp
-            elif bx[i] > COLS - ri:
-                bx[i] = COLS - ri
+            elif bx[i] > COLS * LCELL - rx:
+                bx[i] = COLS * LCELL - rx
                 if bvx[i] > 0.0:
                     bvx[i] *= 1.0 - damp
-        if by[i] < ri:
-            by[i] = ri
+        if by[i] < rx:
+            by[i] = rx
             if bvy[i] < 0.0:
                 bvy[i] *= 1.0 - damp
-        if by[i] > ROWS - ri:
-            by[i] = ROWS - ri
+        if by[i] > ROWS * LCELL - rx:
+            by[i] = ROWS * LCELL - rx
             if bvy[i] > 0.0:
                 bvy[i] *= 1.0 - damp
-
-
 @ti.kernel
 def count_bonds():
     for i in range(bcount[None]):
         nbond[i] = 0
+        hasL[i] = 0
+        hasR[i] = 0
     for i in range(bcount[None]):
         for w in range(BMAPW):
             bondMap[i, w] = 0
@@ -1027,6 +207,15 @@ def count_bonds():
             ti.atomic_add(nbond[b], 1)
             ti.atomic_or(bondMap[a, b >> 5], 1 << (b & 31))
             ti.atomic_or(bondMap[b, a >> 5], 1 << (a & 31))
+            # боковая связь: ось связи ближе к горизонтали -> у левого блока
+            # правая грань связана (hasR), у правого — левая грань (hasL)
+            if ti.abs(bx[b] - bx[a]) >= ti.abs(by[b] - by[a]):
+                if bx[b] >= bx[a]:
+                    ti.atomic_max(hasR[a], 1)
+                    ti.atomic_max(hasL[b], 1)
+                else:
+                    ti.atomic_max(hasL[a], 1)
+                    ti.atomic_max(hasR[b], 1)
 
 
 @ti.kernel
@@ -1047,7 +236,7 @@ def build_hash():
 def cleanup_fallen():
     i = bcount[None] - 1
     while i >= 0:
-        if bfixed[i] == 0 and (by[i] > ROWS + 6 or bx[i] < -4 or bx[i] > COLS + 4):
+        if bfixed[i] == 0 and (by[i] > (ROWS + 6) * LCELL or bx[i] < -4 * LCELL or bx[i] > (COLS + 4) * LCELL):
             remove_block_func(i)
         i -= 1
 
@@ -1076,7 +265,8 @@ def compute_top_load_fused(mode: ti.i32):
                 best = i
         topCol[c] = best
         topYArr[c] = bestY
-    # 4. приложение нагрузки: полный вес давит на верхний блок каждой колонки
+    # 4. приложение нагрузки: полный вес давит на верхний блок каждой колонки.
+    #    loadCur — уже Н (вес породы над колонкой шириной 1 клетку).
     f = loadCur[None]
     for c in range(COLS):
         i = topCol[c]
@@ -1094,7 +284,7 @@ def refill_top_overburden(mode: ti.i32):
     досыпаны обломки в соседние колонки — они связываются между собой (если
     рядом). Так обрушение сверху просто приносит новые блоки вниз, как кучу
     породы в шахте."""
-    if mode == 0:
+    if mode == 0 and refillOff[None] == 0:
         c = 0
         while c < COLS:
             newRubble[c] = -1
@@ -1112,8 +302,8 @@ def refill_top_overburden(mode: ti.i32):
                     best = i
                 i += 1
             # верхняя клетка (y=0) свободна, если в колонке вообще нет блока,
-            # либо самый верхний блок опустился ниже неё
-            if best < 0 or bestY >= 1.0:
+            # либо самый верхний блок опустился ниже неё (координаты в м)
+            if best < 0 or bestY >= LCELL:
                 j = add_block_func(c + 0.5, 0.5, 1.0, 0)
                 if j >= 0:
                     newRubble[c] = j
@@ -1140,22 +330,22 @@ def fluid_integrate(dt: ti.f32):
     for i in range(pCount[None]):
         wvy[i] += fwg[None] * dt
         sp2 = wvx[i] * wvx[i] + wvy[i] * wvy[i]
-        if sp2 > 0.16:
-            sc = 0.4 / ti.sqrt(sp2)
+        if sp2 > WVMAX * WVMAX:
+            sc = WVMAX / ti.sqrt(sp2)
             wvx[i] *= sc
             wvy[i] *= sc
         wpx[i] = wx[i]
         wpy[i] = wy[i]
         dx = wvx[i] * dt
         dy = wvy[i] * dt
-        if dx > 0.35:
-            dx = 0.35
-        elif dx < -0.35:
-            dx = -0.35
-        if dy > 0.35:
-            dy = 0.35
-        elif dy < -0.35:
-            dy = -0.35
+        if dx > 0.35 * LCELL:
+            dx = 0.35 * LCELL
+        elif dx < -0.35 * LCELL:
+            dx = -0.35 * LCELL
+        if dy > 0.35 * LCELL:
+            dy = 0.35 * LCELL
+        elif dy < -0.35 * LCELL:
+            dy = -0.35 * LCELL
         wx[i] += dx
         wy[i] += dy
 
@@ -1221,8 +411,8 @@ def fluid_pbd(dt: ti.f32):
                             d = ti.sqrt(d2)
                             q = 1.0 - d / H_SPH
                             D = dt2 * (Pr * q + PrN * q * q)
-                            if D > 0.04:
-                                D = 0.04
+                            if D > 0.04 * LCELL * LCELL:
+                                D = 0.04 * LCELL * LCELL
                             elif D < 0.0:
                                 D = 0.0
                             hx = dx / d * D * 0.4
@@ -1244,12 +434,12 @@ def fluid_apply_corr():
         corrY[i] = 0.0
         if wx[i] < m:
             wx[i] = m
-        elif wx[i] > COLS - m:
-            wx[i] = COLS - m
+        elif wx[i] > COLS * LCELL - m:
+            wx[i] = COLS * LCELL - m
         if wy[i] < m:
             wy[i] = m
-        elif wy[i] > ROWS - m:
-            wy[i] = ROWS - m
+        elif wy[i] > ROWS * LCELL - m:
+            wy[i] = ROWS * LCELL - m
 
 
 @ti.kernel
@@ -1258,8 +448,8 @@ def fluid_vel(dt: ti.f32):
         wvx[i] = (wx[i] - wpx[i]) / dt
         wvy[i] = (wy[i] - wpy[i]) / dt
         s2 = wvx[i] * wvx[i] + wvy[i] * wvy[i]
-        if s2 > 0.25:
-            s = 0.5 / ti.sqrt(s2)
+        if s2 > WVMAX * WVMAX:
+            s = WVMAX / ti.sqrt(s2)
             wvx[i] *= s
             wvy[i] *= s
 
@@ -1271,7 +461,7 @@ def collide_water(acc: ti.i32):
             wfx[i] = 0.0
             wfy[i] = 0.0
     margin = RP_SPH
-    RR = int(ti.ceil(P[None].maxSize * 0.5 + RP_SPH))
+    RR = int(ti.ceil(P[None].maxSize * 0.5 + RP_SPH / LCELL))
     for it in range(3):
         for p in range(pCount[None]):
             cxi = clamp_cell(wx[p])
@@ -1368,15 +558,15 @@ def collide_water(acc: ti.i32):
                     ti.atomic_sub(wfx[bOX], sOX * ti.min(maxOX * P[None].kw, P[None].wCap))
             if wx[p] < margin:
                 wx[p] = margin
-            elif wx[p] > COLS - margin:
-                wx[p] = COLS - margin
+            elif wx[p] > COLS * LCELL - margin:
+                wx[p] = COLS * LCELL - margin
             if wy[p] < margin:
                 wy[p] = margin
-            elif wy[p] > ROWS - margin:
-                wy[p] = ROWS - margin
+            elif wy[p] > ROWS * LCELL - margin:
+                wy[p] = ROWS * LCELL - margin
     p = pCount[None] - 1
     while p >= 0:
-        if wx[p] < -1 or wx[p] > COLS + 1 or wy[p] < -1 or wy[p] > ROWS + 1:
+        if wx[p] < -LCELL or wx[p] > COLS * LCELL + LCELL or wy[p] < -LCELL or wy[p] > ROWS * LCELL + LCELL:
             kill_particle(p)
         p -= 1
 
@@ -1390,7 +580,7 @@ def fluid_frame_start():
 
 @ti.kernel
 def fluid_clamp_disp():
-    LIM = 1.5
+    LIM = 1.5 * LCELL
     for i in range(pCount[None]):
         dx = wx[i] - fx0[i]
         if dx > LIM:
@@ -1419,11 +609,11 @@ def spawn_water(n: ti.i32, vm: ti.f32, x0: ti.f32, y0: ti.f32, a0: ti.f32):
 def fill_pct() -> ti.f32:
     n = 0.0
     for i in range(pCount[None]):
-        dx = (wx[i] - cavX[None]) / cavRX[None]
-        dy = (wy[i] - cavY[None]) / cavRY[None]
+        dx = (wx[i] / LCELL - cavX[None]) / cavRX[None]
+        dy = (wy[i] / LCELL - cavY[None]) / cavRY[None]
         if dx * dx + dy * dy < 1.0:
             n += 1.0
-    cap = PI * cavRX[None] * cavRY[None] / (PI * RP_SPH * RP_SPH)
+    cap = PI * cavRX[None] * cavRY[None] * LCELL * LCELL / (PI * RP_SPH * RP_SPH)
     p = n / cap * 100.0
     if p > 100.0:
         p = 100.0
@@ -1503,12 +693,28 @@ def reset_all():
     for i in range(MAXB):
         bfixed[i] = 0
         nbond[i] = 0
+        hasL[i] = 0
+        hasR[i] = 0
+        supp[i] = 0
+        comIn[i] = 0
+        supLo[i] = 1e9
+        supHi[i] = -1e9
     for bd in range(MAXBONDS):
         bondIntact[bd] = 0
         bondE[bd] = 0.0
+        bondPlast[bd] = 0.0
+        bondSlip[bd] = 0.0
+        bondFlow[bd] = 0
+        bondCreep[bd] = 0.0
     for i in range(MAXB):
         for w in range(BMAPW):
             bondMap[i, w] = 0
+
+
+@ti.kernel
+def update_mass_rho():
+    for i in range(bcount[None]):
+        bmass[i] = P[None].rho * bsz[i] * bsz[i]
 
 
 @ti.kernel
@@ -1596,7 +802,7 @@ def remove_source(x, y):
 def emit_sources():
     if srcCount[None] == 0:
         return
-    v0 = math.sqrt(2.0 * G_PHYS * P[None].head) * VEL_SCALE
+    v0 = math.sqrt(2.0 * G_PHYS * P[None].head)    # м/с: скорость вылета воды по высоте напора
     for i in range(srcCount[None]):
         spawn_water(3, v0, srcX[i], srcY[i], PI * 0.5)
 
@@ -1607,19 +813,6 @@ def emit_sources():
 # только после полного расчёта предыдущего (никакой привязки к кадрам или
 # реальному времени — скорость тиков ограничена только CPU). Подшаги интегрирования
 # внутри тика — локальная деталь решателя; наружу виден только тик.
-SUBSTEPS = 192
-DT = TICK / SUBSTEPS              # с: подшаг интегрирования DEM внутри тика
-TOPO_EVERY = 48   # пересборка топологии (хэш, nbond, поля напряжений) каждые N подшагов:
-                  # слишком частая (12) усиливает вертикальные трещины сверху при большой нагрузке,
-                  # 48 — баланс между свежестью топологии и стабильностью
-FRIC_FORGET_T = 3.0 * TICK        # с: как долго "помнить" накопленный сдвиг трения
-COMPACT_EVERY_T = 0.5             # с: период пересборки/уплотнения связей
-SLEEP_V2 = 1.5e-3                 # (клетки/с)²: порог скорости "уснувшего" блока
-SLEEP_A2 = 4.0                    # (клетки/с²)²: порог равнодействующей силы — блок спит только
-                                  # если почти неподвижен И силы уравновешены (лежит на опоре), иначе
-                                  # падающий/подпрыгнувший блок не замораживается в воздухе
-
-
 def fluid_step(dt):
     fluid_integrate(dt)
     fluid_hash()
@@ -1654,6 +847,12 @@ def step_physics(mode, dt=None):
     compute_top_load(mode)
     count_bonds()
     refresh_field()
+    # множители демпфирования на ПОДШАГ: базовые константы заданы на тик, подшагов
+    # SUBSTEPS за тик, поэтому берём base^(dt/TICK) — итог за тик ровно DAMP_*_TICK.
+    dfree = DAMP_FREE_TICK ** (dt / TICK)
+    dsupp = DAMP_SUPP_TICK ** (dt / TICK)
+    drotFree = DAMP_ROT_FREE_TICK ** (dt / TICK)
+    drotBond = DAMP_ROT_BOND_TICK ** (dt / TICK)
     for ss in range(SUBSTEPS):
         if ss % TOPO_EVERY == 0:
             # топология (занятость клеток, вертикальное напряжение, контактный хэш,
@@ -1667,8 +866,87 @@ def step_physics(mode, dt=None):
         phys_reset()
         phys_bonds(dt)
         phys_contact(dt)
-        phys_integrate(dt)
+        phys_rock()
+        phys_integrate(dt, dfree, dsupp, drotFree, drotBond)
     cleanup_fallen()
     if simT[None] - compactT[None] >= COMPACT_EVERY_T:
         compact_bonds()
         compactT[None] = simT[None]
+    # --- равномерная сводка по всем блокам после каждого тика ---
+    # Полная энергия каждого блока и интегралы системы + центр тяжести.
+    # Считаются для ВСЕХ блоков одинаково, каждый тик — контроль закона
+    # сохранения энергии и положения центра тяжести.
+    compute_energy()
+    center_of_mass()
+
+# ================================================================== энергия и центр тяжести
+@ti.kernel
+def compute_energy():
+    """Полная энергия КАЖДОГО блока + общие интегралы системы (Дж).
+
+    benergy[i] = ½·m·v² (кинетика) + ½·I·ω² (вращение) + m·g·y (потенциал)
+                 + ½·Σ упругих энергий своих связей.
+    Закреплённые блоки (опора) исключены из интегралов: у них бесконечная
+    реакция опоры, их учёт не даёт физически содержательного баланса. Работа
+    выполняется ОДИНАКОВО для всех блоков каждый тик — физика равномерна.
+
+    Диссипация (демпфирование, кулоновское трение, пластика) уменьшает полную
+    энергию — это честный отток энергии в тепло. Баланс нужен, чтобы доказать,
+    что энергия НЕ генерируется из ниоткуда (нет дрейфа/взрывов)."""
+    energyKin[None] = 0.0
+    energyRot[None] = 0.0
+    energyPot[None] = 0.0
+    energyEl[None] = 0.0
+    g = P[None].g
+    for i in range(bcount[None]):
+        benergy[i] = 0.0
+        if bfixed[i] == 1:
+            continue
+        m = bmass[i]
+        v2 = bvx[i] * bvx[i] + bvy[i] * bvy[i]
+        ke = 0.5 * m * v2
+        I = m * bsz[i] * bsz[i] / 6.0
+        re = 0.5 * I * bw[i] * bw[i]
+        pe = m * g * by[i]
+        benergy[i] = ke + pe + re
+        energyKin[None] += ke
+        energyRot[None] += re
+        energyPot[None] += pe
+    for bd in range(bondCount[None]):
+        if bondIntact[bd] == 1:
+            e = bondE[bd]
+            energyEl[None] += e
+            ti.atomic_add(benergy[bondA[bd]], e * 0.5)
+            ti.atomic_add(benergy[bondB[bd]], e * 0.5)
+    energyTotal[None] = energyKin[None] + energyRot[None] + energyPot[None] + energyEl[None]
+
+
+@ti.kernel
+def center_of_mass():
+    """Центр тяжести системы (при однородном g совпадает с центром масс).
+
+    Учитываются только подвижные блоки (bfixed==0); закреплённая «стена» — опора
+    и граница модели, а не часть обрушаемого массива."""
+    comX[None] = 0.0
+    comY[None] = 0.0
+    comMass[None] = 0.0
+    for i in range(bcount[None]):
+        if bfixed[i] == 1:
+            continue
+        m = bmass[i]
+        comMass[None] += m
+        comX[None] += m * bx[i]
+        comY[None] += m * by[i]
+    if comMass[None] > 0.0:
+        comX[None] /= comMass[None]
+        comY[None] /= comMass[None]
+
+
+def energy_report():
+    """Сводка энергии системы после последнего тика: (kin, rot, pot, elast, total), Дж."""
+    return (energyKin[None], energyRot[None], energyPot[None], energyEl[None], energyTotal[None])
+
+
+def center_of_mass_report():
+    """Центр тяжести (масс) после последнего тика: (x, y, масса), м/кг."""
+    return (comX[None], comY[None], comMass[None])

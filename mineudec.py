@@ -17,10 +17,24 @@ def _is_ascii(s):
     return all(ord(c) < 128 for c in s)
 
 
+def _taichi_home():
+    """Путь до каталога taichi в site-packages — без импорта самого taichi.
+
+    Импорт taichi в родительском процессе заставляет его захватывать lock
+    кеша компиляции (ticache.lock), который потом не может взять дочерний
+    процесс — отсюда предупреждение "[W] Lock ... failed". Чтобы родитель не
+    создавал лишний KernelCompilationManager, ограничиваемся поиском пути.
+    """
+    for p in sys.path:
+        if p and "site-packages" in p.replace("\\", "/").lower():
+            return p
+    return None
+
+
 def _needs_relaunch():
+    home = _taichi_home()
     try:
-        import taichi
-        return not _is_ascii(os.path.dirname(taichi.__file__))
+        return home is not None and not _is_ascii(home)
     except Exception:
         return False
 

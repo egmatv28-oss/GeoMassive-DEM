@@ -18,6 +18,10 @@ import taichi as ti
 from solver import *
 
 # =================================================== модель: служебные поля генерации
+# Позиции блоков/воды/пыли в решателе — в МЕТРАХ (см. solver). Чтобы нарисовать их
+# в пикселях (CELL пикселей на клетку), нужен масштаб PX = CELL / LCELL.
+PX = CELL / LCELL
+
 # (сетка занятости клеток и пометки разрезов используются только при построении
 # модели на регулярной сетке; в физике их нет)
 cutR = ti.field(ti.i32, N)
@@ -31,6 +35,18 @@ r_block = ti.field(ti.i32, N)
 
 img = ti.Vector.field(3, ti.f32, (W, H))
 
+# камера: CAMX/CAMY — смещение картинки в пикселях окна, CAMZ — масштаб
+# (во сколько раз увеличен рисунок; 1.0 = как раньше). Хранятся в полях,
+# чтобы их видели GPU-ядра отрисовки.
+CAMX = ti.field(ti.f32, ())
+CAMY = ti.field(ti.f32, ())
+CAMZ = ti.field(ti.f32, ())
+CAMX[None] = 0.0
+CAMY[None] = 0.0
+CAMZ[None] = 1.0
+CAM_ZMIN = 0.25
+CAM_ZMAX = 8.0
+
 # ================================================================== отрисовка
 BG = ti.Vector([0.0431, 0.0667, 0.0941])
 GRID = ti.Vector([0.49, 0.608, 0.765])
@@ -40,6 +56,7 @@ FIXED = ti.Vector([0.169, 0.212, 0.267])
 CRACK = ti.Vector([0.0167, 0.0267, 0.04])
 ORANGE = ti.Vector([0.75, 0.312, 0.179])
 BLUE = ti.Vector([0.261, 0.395, 0.546])
+PURPLE = ti.Vector([0.72, 0.32, 0.9])
 JOINT = ti.Vector([0.34, 0.41, 0.48])
 WHITE = ti.Vector([1.0, 1.0, 1.0])
 
@@ -151,10 +168,17 @@ def fill_diamond(cx: ti.f32, cy: ti.f32, rad: ti.f32, col: ti.template()):
 
 @ti.kernel
 def render_base():
+    z = CAMZ[None]
+    k = PX * z
+    ox = CAMX[None]
+    oy = CAMY[None]
+    d = 0.5 / k
     for X in range(W):
         for Y in range(H):
             col = BG
-            if X % CELL == 0 or Y % CELL == 0:
+            wx = (X + 0.5 - ox) / k
+            wy = (H - 1.5 - Y - oy) / k
+            if ti.abs(wx - ti.round(wx)) < d or ti.abs(wy - ti.round(wy)) < d:
                 a = 0.045
                 col = col * (1.0 - a) + GRID * a
             img[X, Y] = col
@@ -184,11 +208,14 @@ def render_triangles(t: ti.f32, on: ti.i32):
 
 @ti.kernel
 def render_blocks():
+    z = CAMZ[None]
+    ox = CAMX[None]
+    oy = CAMY[None]
     for i in range(bcount[None]):
-        ri = bsz[i] * CELL * 0.5
-        px = int(bsz[i] * CELL)
-        X = int(bx[i] * CELL - ri)
-        Y = H - 1 - int(by[i] * CELL + ri)
+        ri = bsz[i] * PX * z * 0.5
+        px = int(bsz[i] * PX * z)
+        X = int(bx[i] * PX * z + ox - ri)
+        Y = H - 1 - int(by[i] * PX * z + oy + ri)
         if bfixed[i] == 1:
             fill_rect(X, Y, X + px - 1, Y + px - 1, FIXED)
             diag = FIXED * (1.0 - 0.35) + AMBER * 0.35
@@ -214,7 +241,7 @@ def render_blocks():
                 b = b + (228.0 - b) * u
             col = ti.Vector([r / 255.0, g / 255.0, b / 255.0])
             if ti.abs(brot[i]) > 0.02:
-                fill_rot_rect(bx[i] * CELL, H - 1 - by[i] * CELL, brot[i], ri, col)
+                fill_rot_rect(bx[i] * PX * z + ox, H - 1 - (by[i] * PX * z + oy), brot[i], ri, col)
             else:
                 fill_rect(X, Y, X + px - 1, Y + px - 1, col)
                 hl = col * (1.0 - 0.07) + WHITE * 0.07
@@ -224,20 +251,28 @@ def render_blocks():
 @ti.kernel
 def render_bonds(show: ti.i32):
     if show == 1:
+        z = CAMZ[None]
+        ox = CAMX[None]
+        oy = CAMY[None]
         for bd in range(bondCount[None]):
             if bondIntact[bd] == 1:
                 r = bondR[bd]
                 a = bondA[bd]
                 b = bondB[bd]
                 if r > 0.12:
-                    draw_line(bx[a] * CELL, H - 1 - by[a] * CELL, bx[b] * CELL, H - 1 - by[b] * CELL, ORANGE, 2.0)
+                    draw_line(bx[a] * PX * z + ox, H - 1 - (by[a] * PX * z + oy),
+                              bx[b] * PX * z + ox, H - 1 - (by[b] * PX * z + oy), ORANGE, 2.0)
                 elif r < -0.12:
-                    draw_line(bx[a] * CELL, H - 1 - by[a] * CELL, bx[b] * CELL, H - 1 - by[b] * CELL, BLUE, 2.0)
+                    draw_line(bx[a] * PX * z + ox, H - 1 - (by[a] * PX * z + oy),
+                              bx[b] * PX * z + ox, H - 1 - (by[b] * PX * z + oy), BLUE, 2.0)
 
 
 @ti.kernel
 def render_joints():
     # швы между связанными блоками (линия по общему ребру, поперёк связи)
+    z = CAMZ[None]
+    ox = CAMX[None]
+    oy = CAMY[None]
     for bd in range(bondCount[None]):
         if bondIntact[bd] == 0:
             continue
@@ -253,15 +288,22 @@ def render_joints():
         ux = dx / d
         uy = dy / d
         w = ti.min(bsz[a], bsz[b]) * 0.5
-        px = -uy * w * CELL
-        py = ux * w * CELL
-        cx0 = mx * CELL
-        cy0 = H - 1 - my * CELL
+        px = -uy * w * PX * z
+        py = ux * w * PX * z
+        cx0 = mx * PX * z + ox
+        cy0 = H - 1 - (my * PX * z + oy)
         draw_line(cx0 - px, cy0 - py, cx0 + px, cy0 + py, JOINT, 1.0)
+        # пластически текущая связь — фиолетовым ПО ГРАНИ (не вместо напряжений):
+        # усилия (оранжевый/синий) рисуются в render_bonds, здесь только шов-маркер
+        if bondFlow[bd] == 1:
+            draw_line(cx0 - px, cy0 - py, cx0 + px, cy0 + py, PURPLE, 3.0)
 
 
 @ti.kernel
 def render_cracks():
+    z = CAMZ[None]
+    ox = CAMX[None]
+    oy = CAMY[None]
     for bd in range(bondCount[None]):
         if bondIntact[bd] == 1:
             continue
@@ -269,12 +311,12 @@ def render_cracks():
         b = bondB[bd]
         dx = bx[b] - bx[a]
         dy = by[b] - by[a]
-        if dx * dx + dy * dy > 1.7:
+        if dx * dx + dy * dy > 1.7 * LCELL * LCELL:
             continue
-        mx = (bx[a] + bx[b]) * 0.5 * CELL
-        my = H - 1 - (by[a] + by[b]) * 0.5 * CELL
-        j = bondJ[bd] * CELL
-        hl = ti.min(bsz[a], bsz[b]) * CELL * 0.55
+        mx = (bx[a] + bx[b]) * 0.5 * PX * z + ox
+        my = H - 1 - ((by[a] + by[b]) * 0.5 * PX * z + oy)
+        j = bondJ[bd] * PX * z
+        hl = ti.min(bsz[a], bsz[b]) * PX * z * 0.55
         if ti.abs(dx) >= ti.abs(dy):
             draw_line(mx + j * 0.4, my - hl, mx - j * 0.4, my + hl, CRACK, 2.0)
         else:
@@ -283,16 +325,22 @@ def render_cracks():
 
 @ti.kernel
 def render_water():
-    s = RP_SPH * 2.0 * CELL * 0.95
+    z = CAMZ[None]
+    ox = CAMX[None]
+    oy = CAMY[None]
+    s = RP_SPH * 2.0 * PX * z * 0.95
     core = CYAN
     for i in range(pCount[None]):
-        cx = wx[i] * CELL - s * 0.5
-        cy = H - 1 - wy[i] * CELL - s * 0.5
+        cx = wx[i] * PX * z + ox - s * 0.5
+        cy = H - 1 - (wy[i] * PX * z + oy) - s * 0.5
         fill_rect(int(cx), int(cy), int(cx + s), int(cy + s), core)
 
 
 @ti.kernel
 def render_dust():
+    z = CAMZ[None]
+    ox = CAMX[None]
+    oy = CAMY[None]
     for i in range(dustCount[None]):
         if i >= MAXDUST:
             continue
@@ -301,31 +349,35 @@ def render_dust():
         if dustCol[i] == 1:
             c = ti.Vector([0.471, 0.667, 0.784])
         cc = BG * (1.0 - a) + c * a
-        cx = int(dustX[i] * CELL - 2)
-        cy = H - 1 - int(dustY[i] * CELL - 2)
+        cx = int(dustX[i] * PX * z + ox) - 2
+        cy = H - 1 - int(dustY[i] * PX * z + oy) + 2
         fill_rect(cx, cy, cx + 3, cy + 3, cc)
 
 
 @ti.kernel
 def render_sources(t: ti.f32):
+    z = CAMZ[None]
+    ox = CAMX[None]
+    oy = CAMY[None]
     for s in range(srcCount[None]):
-        X = srcX[s] * CELL
-        Y = H - 1 - srcY[s] * CELL
+        X = srcX[s] * LCELL * PX * z + ox
+        Y = H - 1 - (srcY[s] * LCELL * PX * z + oy)
         pulse = (t * 1.1 + srcPh[s]) % 1.0
-        r = (0.35 + pulse * 0.95) * CELL
+        r = (0.35 + pulse * 0.95) * CELL * z
         draw_circle_outline(X, Y, r, CYAN * (0.55 * (1.0 - pulse)) + BG * (1.0 - 0.55 * (1.0 - pulse)), 2.0)
-        fill_diamond(X, Y, 5.0, CYAN)
+        fill_diamond(X, Y, 5.0 * z, CYAN)
 
 
 @ti.kernel
 def render_mouse(mx: ti.f32, my: ti.f32, brush: ti.f32, is_water: ti.i32):
     if mx > -900.0:
-        X = mx * CELL
-        Y = H - 1 - my * CELL
+        z = CAMZ[None]
+        X = mx * CELL * z + CAMX[None]
+        Y = H - 1 - (my * CELL * z + CAMY[None])
         if is_water == 1:
-            draw_circle_outline(X, Y, 8.0, CYAN * 0.7, 1.5)
+            draw_circle_outline(X, Y, 8.0 * z, CYAN * 0.7, 1.5)
         else:
-            r = (brush / 2.0 + 0.3) * CELL
+            r = (brush / 2.0 + 0.3) * CELL * z
             draw_circle_outline(X, Y, r, AMBER * 0.7, 1.5)
 
 
@@ -651,6 +703,7 @@ def generate(mode, weak):
         build_bigblocks()
         return
     reset_all()
+    refillOff[None] = 0   # новая сцена — досыпка сверху снова включена
     if mode == 0:
         gen_tunnel(weak)
     else:
@@ -701,23 +754,25 @@ def stamp_rock(x: ti.f32, y: ti.f32, r: ti.f32):
 
 @ti.kernel
 def stamp_erase(x: ti.f32, y: ti.f32, r: ti.f32):
+    # x, y, r — в клетках; позиции блоков bx/by — в метрах
     i = bcount[None] - 1
     while i >= 0:
         if bfixed[i] == 0:
-            dx = bx[i] - x
-            dy = by[i] - y
-            if dx * dx + dy * dy < r * r:
+            dx = bx[i] - x * LCELL
+            dy = by[i] - y * LCELL
+            if dx * dx + dy * dy < r * r * LCELL * LCELL:
                 remove_block_func(i)
         i -= 1
 
 
 @ti.kernel
 def crack_at(x: ti.f32, y: ti.f32, r: ti.f32):
-    r2 = r * r
+    # x, y, r — в клетках; позиции блоков bx/by — в метрах
+    r2 = r * r * LCELL * LCELL
     for bd in range(bondCount[None]):
         if bondIntact[bd] == 1:
-            mx = (bx[bondA[bd]] + bx[bondB[bd]]) * 0.5 - x
-            my = (by[bondA[bd]] + by[bondB[bd]]) * 0.5 - y
+            mx = (bx[bondA[bd]] + bx[bondB[bd]]) * 0.5 - x * LCELL
+            my = (by[bondA[bd]] + by[bondB[bd]]) * 0.5 - y * LCELL
             if mx * mx + my * my < r2:
                 a = bondA[bd]
                 b = bondB[bd]
@@ -782,9 +837,9 @@ def clear_scene():
             axx = ti.abs(dx)
             ayy = ti.abs(dy)
             rs = ri + rj
-            if axx > rs - 0.05 and axx < rs + 0.05 and ayy < ti.min(ri, rj):
+            if axx > rs - 0.05 * LCELL and axx < rs + 0.05 * LCELL and ayy < ti.min(ri, rj):
                 add_bond_func(i, j, ti.sqrt(dx * dx + dy * dy), 1)
-            elif ayy > rs - 0.05 and ayy < rs + 0.05 and axx < ti.min(ri, rj):
+            elif ayy > rs - 0.05 * LCELL and ayy < rs + 0.05 * LCELL and axx < ti.min(ri, rj):
                 add_bond_func(i, j, ti.sqrt(dx * dx + dy * dy), 1)
             j += 1
         i += 1
@@ -804,7 +859,7 @@ def dust_step():
             continue
         dustX[i] += dustVX[i]
         dustY[i] += dustVY[i]
-        dustVY[i] += 0.004
+        dustVY[i] += 0.004 * LCELL
         dustLife[i] -= 0.04
 
 
@@ -826,6 +881,38 @@ def dust_compact():
 
 
 # ================================================================== ввод
+# курсор окна (нормализованные координаты) -> координаты КЛЕТОК модели
+def cursor_to_cells(pos):
+    k = CELL * CAMZ[None]
+    sx = pos[0] * W
+    sy = pos[1] * H
+    mx = (sx - CAMX[None]) / k
+    my = (H - 1.5 - sy - CAMY[None]) / k
+    return mx, my
+
+
+# колёсико/кнопки: зум с сохранением точки, на которую смотрим (под курсором)
+def zoom_at(pos, factor):
+    z0 = CAMZ[None]
+    z1 = min(CAM_ZMAX, max(CAM_ZMIN, z0 * factor))
+    if z1 == z0:
+        return
+    sx = pos[0] * W
+    sy = pos[1] * H
+    wx = (sx - CAMX[None]) / (PX * z0)
+    wy = (H - 1.5 - sy - CAMY[None]) / (PX * z0)
+    k = PX * z1
+    CAMX[None] = sx - wx * k
+    CAMY[None] = H - 1.5 - sy - wy * k
+    CAMZ[None] = z1
+
+
+def reset_camera():
+    CAMZ[None] = 1.0
+    CAMX[None] = 0.0
+    CAMY[None] = 0.0
+
+
 def do_stroke(mx, my, last_mx, last_my, tool, brush):
     dx = mx - last_mx
     dy = my - last_my
@@ -879,6 +966,10 @@ def run_selftest(frames=120):
         % (frames, t_phys, frames / t_phys, bcount[None], pCount[None], broken[None], fill)
     )
     print("selftest: vnutrennee vremya simulyatsii = %.3f s" % simT[None])
+    ek, er, ep, ee, et = energy_report()
+    cex, cey, cem = center_of_mass_report()
+    print("selftest: energiya Dzh: kin=%.3e rot=%.3e pot=%.3e elast=%.3e total=%.3e" % (ek, er, ep, ee, et))
+    print("selftest: centr tyazhesti: x=%.3f m, y=%.3f m, massa=%.3f kg" % (cex, cey, cem))
     if broken[None] > 0:
         print("selftest: WARNING — bonds broke during settle (broken=%d)" % broken[None])
 
@@ -902,7 +993,7 @@ def run_selftest(frames=120):
 
     t0 = time.perf_counter()
     generate(0, 0)
-    spawn_water(1200, 0.03, COLS * 0.5, ROWS * 0.3, PI * 0.5)
+    spawn_water(1200, 1.8 * LCELL, COLS * 0.5, ROWS * 0.3, PI * 0.5)
     for f in range(40):
         step_physics(0, DT)
     fp = fill_pct()
@@ -978,6 +1069,9 @@ def run_gui():
     flash_wall = 0.0           # реальное время (time.perf_counter) для всплывающих сообщений
     last_broken = 0
     last_hud_broken = 0
+    cam_drag = False          # зажата средняя кнопка — таскаем камеру
+    cam_prev = (0.0, 0.0)     # курсор прошлого кадра (для дельты драга)
+    seen_keys = set()         # диагностика неизвестных событий ввода (в консоль)
 
     while window.running:
         now = time.perf_counter()
@@ -985,42 +1079,94 @@ def run_gui():
         last = now
         t_sim = simT[None]     # внутреннее время симуляции (сек, дробное)
 
-        for e in window.get_events(ti.ui.PRESS):
-            k = e.key
-            if k == ti.ui.ESCAPE:
-                window.running = False
-            elif k == ti.ui.SPACE:
-                paused = not paused
-            elif k in ("1", "2", "3", "4"):
-                tool = int(k) - 1
-            elif k == ti.ui.LMB:
-                pos = window.get_cursor_pos()
-                mx = pos[0] * COLS
-                my = (1.0 - pos[1]) * ROWS
-                if pos[0] > 0.71:
+        try:
+            # один проход по ВСЕМ событиям (колесо — не типа PRESS, отдельный
+            # фильтр его теряет). Отпускание кнопки/клавиши отличаем от нажатия
+            # через window.is_pressed(k): у события отпуска is_pressed == False.
+            for e in window.get_events():
+                k = e.key
+                if k == "Wheel" or k == "WHEEL":
+                    # колесо — зум к точке под курсором (delta[1] > 0 = к нам)
+                    dy = 0.0
+                    try:
+                        d = e.delta
+                        dy = d[1] if isinstance(d, (tuple, list)) else float(d)
+                    except Exception:
+                        dy = 0.0
+                    if dy != 0.0:
+                        pos = window.get_cursor_pos()
+                        f = 1.15 if dy > 0 else 1.0 / 1.15
+                        zoom_at(pos, f)
                     continue
-                if tool == 2:
-                    flash_msg = place_source(mx, my)
-                    flash_wall = now
-                else:
-                    last_mx = mx
-                    last_my = my
-                    last_mx, last_my = do_stroke(mx, my, last_mx, last_my, tool, brush)
-            elif k == ti.ui.RMB:
-                pos = window.get_cursor_pos()
-                if remove_source(pos[0] * COLS, (1.0 - pos[1]) * ROWS):
-                    flash_msg = "Istochnik ubran"
-                    flash_wall = now
+                if k == ti.ui.ESCAPE:
+                    window.running = False
+                    continue
+                if k not in (ti.ui.SPACE, "0", "1", "2", "3", "4",
+                             ti.ui.LMB, ti.ui.RMB, ti.ui.MMB):
+                    if k not in seen_keys:
+                        seen_keys.add(k)
+                        print("input: neizvestnoye sobytiye key=%r delta=%r" % (k, getattr(e, "delta", None)))
+                    continue
+                if not window.is_pressed(k):
+                    continue          # событие отпуска кнопки/клавиши — игнор
+                if k == ti.ui.SPACE:
+                    paused = not paused
+                elif k in ("1", "2", "3", "4"):
+                    tool = int(k) - 1
+                elif k == "0":
+                    reset_camera()
+                    pos = window.get_cursor_pos()
+                    if pos[0] <= 0.71:
+                        flash_msg = "Kamera sbroshena"
+                        flash_wall = now
+                elif k == ti.ui.LMB:
+                    pos = window.get_cursor_pos()
+                    mx, my = cursor_to_cells(pos)
+                    if pos[0] > 0.71:
+                        continue
+                    if tool == 2:
+                        flash_msg = place_source(mx, my)
+                        flash_wall = now
+                    else:
+                        last_mx = mx
+                        last_my = my
+                        last_mx, last_my = do_stroke(mx, my, last_mx, last_my, tool, brush)
+                elif k == ti.ui.RMB:
+                    pos = window.get_cursor_pos()
+                    mx, my = cursor_to_cells(pos)
+                    if remove_source(mx, my):
+                        flash_msg = "Istochnik ubran"
+                        flash_wall = now
+                elif k == ti.ui.MMB:
+                    # зажатие СКМ — начать перетаскивание камеры
+                    pos = window.get_cursor_pos()
+                    if pos[0] <= 0.71:
+                        cam_drag = True
+                        cam_prev = pos
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            flash_msg = "Oshibka vvoda - smotrite konsol"
+            flash_wall = now
 
         if window.is_pressed(ti.ui.LMB):
             pos = window.get_cursor_pos()
             if pos[0] <= 0.71:
-                mx = pos[0] * COLS
-                my = (1.0 - pos[1]) * ROWS
+                mx, my = cursor_to_cells(pos)
                 if tool != 2 and last_mx >= 0:
                     last_mx, last_my = do_stroke(mx, my, last_mx, last_my, tool, brush)
                 if tool == 2 and last_mx < 0:
                     pass
+
+        # перетаскивание камеры СКМ: двигаем за курсором
+        if cam_drag and window.is_pressed(ti.ui.MMB):
+            pos = window.get_cursor_pos()
+            if pos[0] <= 0.71:
+                CAMX[None] += pos[0] * W - cam_prev[0] * W
+                CAMY[None] -= pos[1] * H - cam_prev[1] * H
+                cam_prev = pos
+        else:
+            cam_drag = False
 
         # ---- GUI
         gui.begin("Upravlenie", 0.72, 0.02, 0.27, 0.96)
@@ -1035,6 +1181,7 @@ def run_gui():
         gui.text("Poroda: E=%d GPa, Rt=%d MPa, Rc=%d MPa" % (E_GPa, int(P[None].rp), int(P[None].rp * P[None].rcFactor)))
         gui.text("Napor: %.2f MPa na porodu" % (RHO_W * G_PHYS * P[None].head / 1e6))
         gui.text("LKM - instrument * PKM - istochnik")
+        gui.text("SKM - peretaskivanie * Koleso - zum")
         if gui.button("Poroda (1)"):
             tool = 0
         if gui.button("Treshchina (2)"):
@@ -1060,6 +1207,7 @@ def run_gui():
         P[None].fixedRows = gui.slider_int("Zakrepl. ryadov", P[None].fixedRows, 1, 4)
         P[None].brkCap = gui.slider_int("Limit razryvov/tik", P[None].brkCap, 1, 200)
         P[None].dmgMax = gui.slider_int("Tr. povrezhdeniya, tik", int(P[None].dmgMax), 1, 60)
+        P[None].plastFlow = gui.slider_float("Skor. plast. techeniya, 1/s", P[None].plastFlow, 0.0, 1.0)
         walls = gui.checkbox("Bokovye stenki", P[None].walls == 1)
         P[None].walls = 1 if walls else 0
         weak_new = gui.checkbox("Oslablennye ploskosti", weak == 1)
@@ -1069,7 +1217,7 @@ def run_gui():
             generate(mode, weak)
             flash_msg = "Massiv %s: svyazey %d" % ("oslablen" if weak else "monolitny", count_intact())
             flash_wall = now
-        gv = gui.slider_int("Gravitatsiya x0.1g", int(P[None].g / G_SIM * 10.0), 0, 20)
+        gv = gui.slider_int("Gravitatsiya x0.1g", int(P[None].g / G_PHYS * 10.0), 0, 20)
         apply_gravity(gv / 10.0)
         if gui.button("Vyrabotka"):
             if mode != 0:
@@ -1085,6 +1233,7 @@ def run_gui():
             if mode != 2:
                 mode = 2
                 srcCount[None] = 0
+                refillOff[None] = 0
                 generate(mode, weak)
                 flash_msg = "Mozaika: blokov %d, max razmer %d" % (bcount[None], P[None].maxSize)
                 flash_wall = now
@@ -1105,6 +1254,7 @@ def run_gui():
             flash_wall = now
         if gui.button("Ochistit porodu"):
             clear_scene()
+            refillOff[None] = 1   # запретить досыпку обломков сверху
             flash_msg = "Poroda ubrana"
             flash_wall = now
         show_bonds = 1 if gui.checkbox("Pokazyvat svyazi", show_bonds == 1) else 0
@@ -1127,6 +1277,8 @@ def run_gui():
         gui.text("fps %.0f * blokov %d" % (fps, bcount[None]))
         gui.text("chastits h2o %d%s * svyazey %d" % (pCount[None], " (MAX)" if pCount[None] >= PMAX else "", count_intact()))
         gui.text("razryvov %d * zapolnenie %.0f%%" % (broken[None], fp))
+        gui.text("Energiya: E=%.1e J (K=%.1e, P=%.1e)" % (energyTotal[None], energyKin[None], energyPot[None]))
+        gui.text("Centr tyazhesti: x=%.2f, y=%.2f m, massa=%.0f kg" % (comX[None], comY[None], comMass[None]))
         if flash_msg and (now - flash_wall < 2.0):
             gui.text(flash_msg)
         gui.end()
@@ -1139,7 +1291,7 @@ def run_gui():
         if not paused:
             if rain_until >= 0.0 and t_sim < rain_until:
                 rx = 1.0 + (math.sin(t_sim * 13.7) * 0.5 + 0.5) * (COLS - 2)
-                spawn_water(2, 0.03, rx, 1.2, PI * 0.5)
+                spawn_water(2, 1.8 * LCELL, rx, 1.2, PI * 0.5)
             step_physics(mode)
             t_sim = simT[None]
             dust_step()
@@ -1170,7 +1322,8 @@ def run_gui():
 
         pos = window.get_cursor_pos()
         if pos[0] <= 0.71:
-            render_mouse(pos[0] * COLS, (1.0 - pos[1]) * ROWS, brush, 1 if tool == 2 else 0)
+            mx, my = cursor_to_cells(pos)
+            render_mouse(mx, my, brush, 1 if tool == 2 else 0)
         else:
             render_mouse(-999.0, 0.0, brush, 0)
 
