@@ -3,10 +3,16 @@
 Парные взаимодействия дискретно-элементной модели (DEM). Каждая функция ПРИНИМАЕТ
 текущее состояние (поля из physstate) и ВОЗВРАЩАЕТ результат в силовые поля
 (bfx/bfy/btor); оркестратор тиков (solver.py) затем читает эти силы и интегрирует.
-Здесь «чистый» расчёт, без тиков и расписания:
-  phys_reset   — базовые силы: гравитация, вода, перегрузка, боковой распор;
-  phys_bonds   — силы упругих связей (нормаль/сдвиг/изгиб, пластика, энергия);
-  phys_contact — столкновения блоков + кулоновское трение + конфайнмент трещин.
+
+Ядра расчёта — @ti.func (forces_*), чтобы решатель мог вызывать их ПО ОТДЕЛЬНОСТИ
+(phys_reset / phys_bonds / phys_contact / phys_rock) или ОДНИМ слитым ядром
+phys_forces (reset+bonds+contact) — меньше лаунчей на подшаг, меньше накладных
+расходов CPU и выше загрузка GPU:
+  forces_reset   — базовые силы: гравитация, вода, перегрузка, боковой распор;
+  forces_bonds   — силы упругих связей (нормаль/сдвиг/изгиб, пластика, энергия);
+  forces_contact — точные контакты квадратов (SAT) + трение + конфайнмент трещин;
+  forces_rock    — качание на полу и тормоз перекатывания (вызывается из
+                   phys_integrate — момент нужен непосредственно перед интегрированием).
 Каждый проход выполняется параллельно по ВСЕМ блокам сразу — физика равномерна,
 ни один блок не обходится проходкой.
 """
@@ -16,8 +22,8 @@ import taichi as ti
 from physstate import *
 
 # ================================================================== DEM физика
-@ti.kernel
-def phys_reset():
+@ti.func
+def forces_reset():
     g = P[None].g
     for i in range(bcount[None]):
         bfx[i] = wfx[i]
@@ -78,8 +84,8 @@ def phys_reset():
             ti.atomic_add(bfx[i], push * bmass[i])
 
 
-@ti.kernel
-def phys_bonds(dt: ti.f32):
+@ti.func
+def forces_bonds(dt: ti.f32):
     E = P[None].E
     zeta = P[None].cn
     for bd in range(bondCount[None]):
@@ -107,6 +113,10 @@ def phys_bonds(dt: ti.f32):
         mb = bmass[b]
         mred = ma * mb / (ma + mb + 1e-9)
         k_ax = E * w / brest[bd]    # жёсткость связи, Н/м
+        # предел устойчивости явной схемы (см. STAB_C): k ≤ C·m_red/dt²
+        kstab = STAB_C * mred / (dt * dt)
+        if k_ax > kstab:
+            k_ax = kstab
         Ftmax = P[None].rp * P[None].ftScale * w    # Н
         Fcmax = Ftmax * P[None].rcFactor
         Fsmax = Ftmax * P[None].fsFactor
@@ -504,8 +514,8 @@ def apply_contact_point(i: ti.i32, j: ti.i32, fkey: ti.i32,
     friction_vec(i, j, fkey, vt, FnF, dt, tx, ty, px, py, kpt)
 
 
-@ti.kernel
-def phys_contact(dt: ti.f32):
+@ti.func
+def forces_contact(dt: ti.f32):
     k_c = P[None].E * 0.1   # жёсткость контакта полной ширины (Н/м), k = E·A/L
     # динамический радиус поиска в клетках: описанная окружность квадрата r·√2
     # + запас на PROX (пре-контакт для phys_rock)
@@ -533,21 +543,18 @@ def phys_contact(dt: ti.f32):
         cti = ti.cos(brot[i])
         sti = ti.sin(brot[i])
         rx = block_prj(i)          # только для size-aware флагов граней ниже
-        for oy in range(-MAXNBR, MAXNBR + 1):
-            if oy > RR or oy < -RR:
-                continue
+        # радиус поиска — динамический (±RR клеток): без статических 13×13 итераций
+        # на блок (MAXNBR), которые почти все отсеивались фильтром — минус ~85%
+        # холостых проходов хэша на подшаг
+        for oy in range(-RR, RR + 1):
             yy = cyi + oy
             if yy >= 0 and yy < ROWS:
-                for ox in range(-MAXNBR, MAXNBR + 1):
-                    if ox > RR or ox < -RR:
-                        continue
+                for ox in range(-RR, RR + 1):
                     xx = cxi + ox
                     if xx >= 0 and xx < COLS:
                         j = hhead[yy * COLS + xx]
                         while j != -1:
                             if j > i:
-                                dbgPairs[None] += 1
-                                dbgFixed[None] = bfixed[i] * 10 + bfixed[j]
                                 dx = bx[j] - bx[i]
                                 dy = by[j] - by[i]
                                 rj = bsz[j] * 0.5
@@ -598,7 +605,6 @@ def phys_contact(dt: ti.f32):
                                                     nx, ny, sat[1, 1])
                                                 npts = int(pts[2, 0])
                                                 if npts > 0:
-                                                    dbgContacts[None] += 1
                                                     inContact[i] = 1
                                                     inContact[j] = 1
                                                     # --- ПЛОЩАДЬ КОНТАКТА (ширина в 2D) ---
@@ -616,6 +622,10 @@ def phys_contact(dt: ti.f32):
                                                     fp = npts * 1.0
                                                     kpt = k_c * wFrac / fp
                                                     mred = bmass[i] * bmass[j] / (bmass[i] + bmass[j] + 1e-9)
+                                                    # предел устойчивости (см. STAB_C)
+                                                    kstab = STAB_C * mred / (dt * dt)
+                                                    if kpt > kstab:
+                                                        kpt = kstab
                                                     # ζ контакта: перекритическое для пары
                                                     # свободных блоков (рухляк не отскакивает),
                                                     # обычное — если хоть один на связи
@@ -694,8 +704,8 @@ def phys_contact(dt: ti.f32):
                 comIn[i] = 1
 
 
-@ti.kernel
-def phys_rock():
+@ti.func
+def forces_rock():
     """Перекатывание свободного блока + тормоз вращения.
 
     Контакты блок-блок (phys_contact) теперь ТОЧНЫЕ: нормальная сила приложена
@@ -753,3 +763,39 @@ def phys_rock():
         if comIn[i] == 0:
             mu_r = ROLL_MU * 0.15
         ti.atomic_add(btor[i], -mu_r * fn_roll * r * ti.tanh(bw[i] * 2.0))
+
+
+# ================================================================== ядра-обёртки
+# Отдельные ядра сохранены для совместимости (тесты/отладка); рабочий путь
+# решателя — слитое ядро phys_forces (один лаунч на подшаг вместо трёх).
+
+@ti.kernel
+def phys_reset():
+    forces_reset()
+
+
+@ti.kernel
+def phys_bonds(dt: ti.f32):
+    forces_bonds(dt)
+
+
+@ti.kernel
+def phys_contact(dt: ti.f32):
+    forces_contact(dt)
+
+
+@ti.kernel
+def phys_rock():
+    forces_rock()
+
+
+@ti.kernel
+def phys_forces(dt: ti.f32):
+    """Все силы подшага ОДНИМ ядром: базовые силы -> связи -> контакты.
+
+    Три последовательных параллельных прохода внутри одного лаунча: та же
+    физика и тот же порядок, но в 3 раза меньше накладных расходов запуска
+    (CPU не стоит в очереди лаунчей, GPU не простаивает между ядрами)."""
+    forces_reset()
+    forces_bonds(dt)
+    forces_contact(dt)

@@ -6,9 +6,8 @@
 
 Каждый ТИК (step_physics) строит единый распорядок, одинаковый для всех блоков:
   1) проходка состояния — топология, напряжённое поле, контактный хэш, связи;
-  2) передача на расчёт — силы взаимодействий считаются в interactions.py
-     (phys_reset / phys_bonds / phys_contact) одним параллельным проходом
-     по всем блокам;
+   2) передача на расчёт — силы взаимодействий считаются в interactions.py
+      ОДНИМ слитым ядром phys_forces (reset + bonds + contact) за подшаг;
   3) приём и обработка  — phys_integrate читает полученные силы (bfx/bfy/btor),
      интегрирует скорости/позиции, демпфирует, держит блоки в домене;
   4) сводка интегралов  — compute_energy() (полная энергия КАЖДОГО блока и всей
@@ -89,6 +88,10 @@ def apply_water(head_m):
     P[None].head = head_m
 @ti.kernel
 def phys_integrate(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32, drotBond: ti.f32):
+    # моменты качания на полу и тормоз перекатывания (forces_rock) считаются
+    # первыми, прямо перед интегрированием: им нужны supp/comIn/cnck, которые
+    # только что собрал контакт того же подшага. Слитое ядро = минус один лаунч.
+    forces_rock()
     walls = P[None].walls
     for i in range(bcount[None]):
         if bfixed[i] == 1:
@@ -103,6 +106,10 @@ def phys_integrate(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32, d
         # и свободные обломки беспрепятственно раскатываются по поверхности.
         # Нормаль = собственный вес + вес столба над ним (sigVI — Н на клетку).
         kfric = P[None].E
+        # предел устойчивости явной схемы для пружины трения о жёсткую границу (см. STAB_C)
+        kstabF = STAB_C * bmass[i] / (dt * dt)
+        if kfric > kstabF:
+            kfric = kstabF
         nF = bmass[i] * P[None].g + sigVI[row_cell(by[i]) * COLS + clamp_cell(bx[i])]
         if nF < bmass[i] * P[None].g:
             nF = bmass[i] * P[None].g
@@ -833,17 +840,21 @@ def step_physics(mode, dt=None):
     frameBrk[None] = 0
     decay_bond_damage()
     emit_sources()
-    if capWarned[None] == 1 and pCount[None] < PMAX * 0.85:
+    pc = pCount[None]
+    if capWarned[None] == 1 and pc < PMAX * 0.85:
         capWarned[None] = 0
     build_hash()
-    fluid_frame_start()
-    fluid_step(DT_FLUID)
-    collide_water(1)
-    fluid_step(DT_FLUID)
-    collide_water(0)
-    fluid_step(DT_FLUID)
-    collide_water(0)
-    fluid_clamp_disp()
+    # когда воды нет, флюидные подшаги пропускаются ЦЕЛИКОМ: ~25 пустых лаунчей
+    # ядер за тик — заметная доля CPU-накладных расходов (GPU при этом простаивает)
+    if pc > 0:
+        fluid_frame_start()
+        fluid_step(DT_FLUID)
+        collide_water(1)
+        fluid_step(DT_FLUID)
+        collide_water(0)
+        fluid_step(DT_FLUID)
+        collide_water(0)
+        fluid_clamp_disp()
     compute_top_load(mode)
     count_bonds()
     refresh_field()
@@ -863,10 +874,9 @@ def step_physics(mode, dt=None):
             count_bonds()
             refresh_field()
             frameBrk[None] = 0
-        phys_reset()
-        phys_bonds(dt)
-        phys_contact(dt)
-        phys_rock()
+        # ВСЕ силы подшага — одним слитым ядром (reset+bonds+contact), затем
+        # интегрирование (с моментами качания внутри). Два лаунча вместо пяти.
+        phys_forces(dt)
         phys_integrate(dt, dfree, dsupp, drotFree, drotBond)
     cleanup_fallen()
     if simT[None] - compactT[None] >= COMPACT_EVERY_T:

@@ -618,6 +618,95 @@ def gen_solid():
         c += 1
 
 
+# ================================================================== наклонные слои
+# НаклонНАЯ решётка: u — вдоль слоя, v — поперёк. Мировые координаты центра блока:
+#   x = COLS/2 + u·cosθ − v·sinθ,  y = ROWS/2 + u·sinθ + v·cosθ   (клетки, y вниз)
+# Слои и ослабленные плоскости идут ПОД УГЛОМ θ к горизонтали, блоки повёрнуты
+# (brot=θ) — OBB-контакт это поддерживает. Гравитация и давление вышележащих
+# пород (ovf/sigVI решателя) остаются ВЕРТИКАЛЬНЫМИ, как в реальном массиве:
+# в наклонных слоях вес столба даёт вертикальное σ_v, а связи работают на
+# сдвиг/отрыв вдоль наклонных швов — распределение сил другое, и оно возникает
+# из геометрии честно, без поправки "вручную".
+LATN = 160          # сторона решётки (u,v ∈ [−80, 80) — с запасом на диагональ)
+LATH = LATN // 2
+latB = ti.field(ti.i32, LATN * LATN)
+
+
+@ti.kernel
+def gen_tilted(weak: ti.i32, ct: ti.f32, st: ti.f32, cav: ti.i32):
+    """Массив с НАКЛОННЫМИ слоями (θ = atan2(st, ct)), опция: полость выработки.
+
+    weak=1 — две ослабленные плоскости ПО СЛОЯМ (v = WV1/WV2: связи поперёк слоя
+    в этих полосах создаются сразу порванными, intact=0 — наклонные швы, вдоль
+    которых массив может съезжать). cav=1 — эллиптическая выработка (мировые
+    координаты, как в gen_tunnel: горизонтальная выработка в наклонных слоях)."""
+    for c in range(N):
+        r_filled[c] = 0
+        r_block[c] = -1
+        cutR[c] = 0
+        cutD[c] = 0
+    for c in range(LATN * LATN):
+        latB[c] = -1
+    tx = COLS * 0.5
+    ty = ROWS * 0.6
+    trx = 7.0
+    try_ = 5.0
+    cavX[None] = tx
+    cavY[None] = ty
+    cavRX[None] = trx
+    cavRY[None] = try_
+    tilt = ti.atan2(st, ct)
+    ox0 = COLS * 0.5
+    oy0 = ROWS * 0.5
+    WV1 = -6        # ослабленная плоскость 1 (номер полосы v, связь v→v+1 рвётся)
+    WV2 = 7         # ослабленная плоскость 2
+    v = -LATH + 2
+    while v < LATH - 2:
+        u = -LATH + 2
+        while u < LATH - 2:
+            x = ox0 + u * ct - v * st
+            y = oy0 + u * st + v * ct
+            ok = 1
+            if x < 0.75 or x > COLS - 0.75 or y < 0.75 or y > ROWS - 0.5:
+                ok = 0
+            if ok == 1 and cav == 1:
+                dx = (x - tx) / trx
+                dy = (y - ty) / try_
+                if dx * dx + dy * dy < 1.08:
+                    ok = 0
+            if ok == 1:
+                fixed = 1 if (y >= ROWS - 2.0 or y >= ROWS - P[None].fixedRows) else 0
+                i = add_block_func(x, y, 1.0, fixed)
+                if i >= 0:
+                    brot[i] = tilt      # блок повёрнут вдоль слоя
+                    latB[(u + LATH) * LATN + (v + LATH)] = i
+                    cx2 = int(x)
+                    cy2 = int(y)
+                    if cx2 >= 0 and cx2 < COLS and cy2 >= 0 and cy2 < ROWS:
+                        c2 = cy2 * COLS + cx2
+                        if r_block[c2] < 0:
+                            r_block[c2] = i
+                            r_filled[c2] = 1
+            u += 1
+        v += 1
+    # связи вдоль (u+1) и поперёк (v+1) слоя; в ослабленных полосах — рваные.
+    # Индексные переменные vv/uu — НЕ v/u: taichi запрещает переиспользовать
+    # имена уже объявленных в ядре переменных как переменные циклов.
+    for vv in range(-LATH + 2, LATH - 3):
+        for uu in range(-LATH + 2, LATH - 3):
+            a = latB[(uu + LATH) * LATN + (vv + LATH)]
+            if a >= 0:
+                b = latB[(uu + 1 + LATH) * LATN + (vv + LATH)]
+                if b >= 0:
+                    add_bond_func(a, b, 1.0, 1)
+                b = latB[(uu + LATH) * LATN + (vv + 1 + LATH)]
+                if b >= 0:
+                    intact = 1
+                    if weak == 1 and (vv == WV1 or vv == WV2):
+                        intact = 0
+                    add_bond_func(a, b, 1.0, intact)
+
+
 def build_bigblocks():
     """Сцена с блоками ПРОИЗВОЛЬНОГО размера (мозаика 1..3 клетки).
 
@@ -694,18 +783,25 @@ def build_bigblocks():
     build_model(blocks, bonds, water, (cx, cy, rx, ry))
 
 
-def generate(mode, weak):
+def generate(mode, weak, tilt_deg=0.0):
     """Построить модель сцены и передать её в решатель.
 
     mode 0 — выработка (единичные блоки), mode 1 — склон, mode 2 — мозаика
-    произвольных размеров (build_model). weak — ослабленные плоскости."""
+    произвольных размеров (build_model). weak — ослабленные плоскости.
+    tilt_deg — НАКЛОН СЛОЁВ к горизонтали (градусы, + = падение вправо):
+    применяется к сцене «выработка» и к «Заполнить массив»; гравитация и
+    давление вышележащих пород остаются вертикальными (см. gen_tilted)."""
     if mode == 2:
         build_bigblocks()
         return
     reset_all()
     refillOff[None] = 0   # новая сцена — досыпка сверху снова включена
     if mode == 0:
-        gen_tunnel(weak)
+        if abs(tilt_deg) > 0.5:
+            t = math.radians(tilt_deg)
+            gen_tilted(weak, math.cos(t), math.sin(t), 1)
+        else:
+            gen_tunnel(weak)
     else:
         gen_slope(weak)
 
@@ -1046,6 +1142,7 @@ def run_gui():
     brush = 2
     paused = True
     weak = 0
+    tilt_deg = 0        # наклон слоёв к горизонтали, градусы (+ = падение вправо)
     show_bonds = 1
     E_GPa = 10
     rho = RHO_R
@@ -1072,6 +1169,8 @@ def run_gui():
     cam_drag = False          # зажата средняя кнопка — таскаем камеру
     cam_prev = (0.0, 0.0)     # курсор прошлого кадра (для дельты драга)
     seen_keys = set()         # диагностика неизвестных событий ввода (в консоль)
+    tilt_input = False        # режим ввода числа: наклон слоёв (цифры + Enter)
+    tilt_buf = ""             # буфер вводимого угла
 
     while window.running:
         now = time.perf_counter()
@@ -1098,6 +1197,42 @@ def run_gui():
                         f = 1.15 if dy > 0 else 1.0 / 1.15
                         zoom_at(pos, f)
                     continue
+                if tilt_input:
+                    # режим ввода угла наклона: цифры, знак, точка/запятая; Enter —
+                    # применить (перегенерация сцены), Esc — отмена. Все остальные
+                    # клавиши игнорируются, чтобы ввод не переключал инструменты.
+                    if k == ti.ui.RETURN:
+                        try:
+                            tv = float(tilt_buf.replace(",", "."))
+                        except ValueError:
+                            tv = None
+                        if tv is None or tv < -45.0 or tv > 45.0:
+                            flash_msg = "Naklon: nuzhno chislo ot -45 do 45 (vvedeno %r)" % tilt_buf
+                        else:
+                            tilt_deg = tv
+                            srcCount[None] = 0
+                            generate(mode, weak, tilt_deg)
+                            flash_msg = ("Naklon sloev %g grad: sloi pod uglom, "
+                                         "g i nagruzka sverhu - vertikalno" % tilt_deg)
+                        flash_wall = now
+                        tilt_input = False
+                        tilt_buf = ""
+                        continue
+                    if k == ti.ui.ESCAPE:
+                        tilt_input = False
+                        tilt_buf = ""
+                        flash_msg = "Vvod naklona otmenyon"
+                        flash_wall = now
+                        continue
+                    if k == ti.ui.BACKSPACE:
+                        tilt_buf = tilt_buf[:-1]
+                        continue
+                    if k in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+                             "-", "+", ".", ","):
+                        if len(tilt_buf) < 7:
+                            tilt_buf += k
+                        continue
+                    continue    # прочие клавиши в режиме ввода игнорируем
                 if k == ti.ui.ESCAPE:
                     window.running = False
                     continue
@@ -1178,6 +1313,7 @@ def run_gui():
             flash_wall = now
         gui.text("Vremya simulyatsii: %.3f s" % simT[None])
         gui.text("Scena: %s" % scene_names[mode])
+        gui.text("Naklon sloev: %g grad (g - vertikalno)" % tilt_deg)
         gui.text("Poroda: E=%d GPa, Rt=%d MPa, Rc=%d MPa" % (E_GPa, int(P[None].rp), int(P[None].rp * P[None].rcFactor)))
         gui.text("Napor: %.2f MPa na porodu" % (RHO_W * G_PHYS * P[None].head / 1e6))
         gui.text("LKM - instrument * PKM - istochnik")
@@ -1214,38 +1350,51 @@ def run_gui():
         if weak_new != weak:
             weak = 1 if weak_new else 0
             srcCount[None] = 0
-            generate(mode, weak)
+            generate(mode, weak, tilt_deg)
             flash_msg = "Massiv %s: svyazey %d" % ("oslablen" if weak else "monolitny", count_intact())
             flash_wall = now
+        # наклон слоёв — ввод ЧИСЛОМ с клавиатуры (в таичи 1.7 нет input_text):
+        # кнопка открывает режим ввода, цифры/знак/точка набираются, Enter — применить
+        if gui.button("Naklon sloev: %g grad - vvest chislom" % tilt_deg):
+            tilt_input = True
+            tilt_buf = ""
+            flash_msg = "Ugol naklona: vvedite chislo ot -45 do 45 i nazhmite Enter (Esc - otmena)"
+            flash_wall = now
+        if tilt_input:
+            gui.text("Vvod naklona: [ %s ]  Enter - prinat, Esc - otmena" % tilt_buf)
         gv = gui.slider_int("Gravitatsiya x0.1g", int(P[None].g / G_PHYS * 10.0), 0, 20)
         apply_gravity(gv / 10.0)
         if gui.button("Vyrabotka"):
             if mode != 0:
                 mode = 0
                 srcCount[None] = 0
-                generate(mode, weak)
+                generate(mode, weak, tilt_deg)
         if gui.button("Sklon"):
             if mode != 1:
                 mode = 1
                 srcCount[None] = 0
-                generate(mode, weak)
+                generate(mode, weak, tilt_deg)
         if gui.button("Krupnye bloki"):
             if mode != 2:
                 mode = 2
                 srcCount[None] = 0
                 refillOff[None] = 0
-                generate(mode, weak)
+                generate(mode, weak, tilt_deg)
                 flash_msg = "Mozaika: blokov %d, max razmer %d" % (bcount[None], P[None].maxSize)
                 flash_wall = now
         if gui.button("Zapolnit massiv"):
             srcCount[None] = 0
             reset_all()
-            gen_solid()
+            if abs(tilt_deg) > 0.5:
+                t = math.radians(tilt_deg)
+                gen_tilted(weak, math.cos(t), math.sin(t), 0)
+            else:
+                gen_solid()
             flash_msg = "Massiv zapolnen: blokov %d" % bcount[None]
             flash_wall = now
         if gui.button("Peregenerirovat"):
             srcCount[None] = 0
-            generate(mode, weak)
+            generate(mode, weak, tilt_deg)
             flash_msg = "Massiv: svyazey %d" % count_intact()
             flash_wall = now
         if gui.button("Dozhd"):
