@@ -47,6 +47,94 @@ CAMZ[None] = 1.0
 CAM_ZMIN = 0.25
 CAM_ZMAX = 8.0
 
+# python-зеркало камеры: хост-код (курсор/зум/пан) работает с ним, а не читает
+# поля — каждый read скалярного поля из Python это синхронизация CPU<->GPU.
+# GPU-ядра рендера по-прежнему читают поля CAMX/CAMY/CAMZ.
+_CAM = [0.0, 0.0, 1.0]
+
+
+def cam_write(ox, oy, oz):
+    _CAM[0] = ox
+    _CAM[1] = oy
+    _CAM[2] = oz
+    CAMX[None] = ox
+    CAMY[None] = oy
+    CAMZ[None] = oz
+
+
+# =================================================== ввод символов с клавиатуры
+# Taichi GGUI (button_id_to_name в taichi/ui/utils/utils.h) отдаёт события
+# ТОЛЬКО для букв и спецклавиш (Shift/Return/Escape/BackSpace/Space/стрелки):
+# GLFW-коды цифр, минуса и точки кидают std::runtime_error и событие ТЕРЯЕТСЯ
+# в window_base.cpp. То есть цифры через window.get_events() не приходят
+# НИКОГДА — старый «ввод числа угла» был мёртв по этой причине. Символы
+# читаем напрямую из состояния клавиатуры (user32.GetAsyncKeyState), ловя
+# фронт нажатия up->down (авто-повтор ОС не дублирует ввод). Опрос идёт
+# только когда окно Mineudec активно.
+import ctypes
+
+_user32 = ctypes.windll.user32
+_user32.GetActiveWindow.restype = ctypes.c_void_p
+_user32.GetForegroundWindow.restype = ctypes.c_void_p
+_user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+_vk_chars = {}
+for _d in range(10):
+    _vk_chars[0x30 + _d] = str(_d)     # основной ряд цифр
+    _vk_chars[0x60 + _d] = str(_d)     # numpad
+_vk_chars[0xBD] = "-"                  # VK_OEM_MINUS
+_vk_chars[0xBE] = "."                  # VK_OEM_PERIOD
+_vk_chars[0xBC] = "."                  # VK_OEM_COMMA (запятая = десятичная точка)
+_vk_chars[0x6E] = "."                  # VK_DECIMAL (numpad)
+_vk_prev = set()
+_our_hwnd = None
+WIN_TITLE = "Геомассив/2D и DEM"
+
+
+def _app_focused():
+    """Активно ли окно Mineudec: опрос клавиш — только для своего окна."""
+    global _our_hwnd
+    if _our_hwnd is None:
+        _our_hwnd = _user32.GetActiveWindow()
+        if not _our_hwnd:
+            hwnd = _user32.GetForegroundWindow()
+            buf = ctypes.create_unicode_buffer(256)
+            if hwnd:
+                _user32.GetWindowTextW(hwnd, buf, 256)
+            if buf.value.startswith(WIN_TITLE):
+                _our_hwnd = hwnd
+        if not _our_hwnd:
+            _our_hwnd = -1   # окно не нашли — работаем без проверки фокуса
+    if _our_hwnd == -1:
+        return True
+    return _user32.GetForegroundWindow() == _our_hwnd
+
+
+def poll_type_chars():
+    """Символы для набора числа: цифры, '-', '.' (',' и numpad-точка = '.').
+
+    Список символов по фронтам нажатия (up->down); пусто, если окно не активно."""
+    out = []
+    if not _app_focused():
+        _vk_prev.clear()
+        return out
+    for vk, ch in _vk_chars.items():
+        down = (_user32.GetAsyncKeyState(vk) & 0x8000) != 0
+        was = vk in _vk_prev
+        if down and not was:
+            out.append(ch)
+        if down:
+            _vk_prev.add(vk)
+        else:
+            _vk_prev.discard(vk)
+    return out
+
+
+def parse_deg(buf):
+    try:
+        return float(buf.replace(",", "."))
+    except ValueError:
+        return None
+
 # ================================================================== отрисовка
 BG = ti.Vector([0.0431, 0.0667, 0.0941])
 GRID = ti.Vector([0.49, 0.608, 0.765])
@@ -206,8 +294,71 @@ def render_triangles(t: ti.f32, on: ti.i32):
             x += 4
 
 
+@ti.func
+def stress_u(q: ti.f32) -> ti.f32:
+    """Интенсивность цвета напряжения (0..1): гладкая кривая до предела
+    прочности (q=1), выше — насыщенный. Та же функция для блоков и легенды."""
+    u = q if q > 1.0 else q * q * (3.0 - 2.0 * q)
+    if u > 1.0:
+        u = 1.0
+    return u
+
+
+@ti.func
+def stress_band(q: ti.f32, pk: ti.f32) -> ti.i32:
+    """Номер цветового интервала 0..9 для напряжения q (нормировано на прочность)
+    при пике шкалы pk: шкала разбита на 10 равных интервалов 0..pk."""
+    qq = 0.0
+    if pk > 1e-6:
+        qq = q / pk
+    if qq > 1.0:
+        qq = 1.0
+    k = int(qq * 10.0)
+    if k > 9:
+        k = 9
+    return k
+
+
+@ti.func
+def legend_band_color(scale: ti.i32, k: ti.i32):
+    """Цвет интервала k (0..9) шкалы легенды: scale 0 — растяжение
+    (серый->красный), 1 — сжатие (серый->синий). Одна функция и для квадратов
+    легенды, и для блоков — поэтому цвет блока всегда совпадает с квадратом
+    своего интервала на шкале."""
+    uu = stress_u((k + 1.0) / 10.0)
+    r = 112.0
+    g = 121.0
+    b = 134.0
+    if scale == 0:
+        r = r + (255.0 - r) * uu
+        g = g + (101.0 - g) * uu
+        b = b + (58.0 - b) * uu
+    else:
+        r = r + (96.0 - r) * uu
+        g = g + (152.0 - g) * uu
+        b = b + (228.0 - b) * uu
+    return ti.Vector([r / 255.0, g / 255.0, b / 255.0])
+
+
 @ti.kernel
-def render_blocks():
+def stress_peaks():
+    """Пики напряжений по сцене для динамической шкалы легенды (нормировано на
+    прочность: 0 — растяжение, 1 — сжатие). Пик растёт мгновенно, спадает
+    медленно — значения на шкале меняются плавно, без дёрганья."""
+    stressPeakRaw[0] = 0.0
+    stressPeakRaw[1] = 0.0
+    for i in range(bcount[None]):
+        ti.atomic_max(stressPeakRaw[0], bstress[i])
+        ti.atomic_max(stressPeakRaw[1], bstressC[i])
+    for k in range(2):
+        if stressPeakRaw[k] > stressPeak[k]:
+            stressPeak[k] = stressPeakRaw[k]
+        else:
+            stressPeak[k] = stressPeak[k] * 0.97 + stressPeakRaw[k] * 0.03
+
+
+@ti.kernel
+def render_blocks(show: ti.i32):
     z = CAMZ[None]
     ox = CAMX[None]
     oy = CAMY[None]
@@ -229,12 +380,14 @@ def render_blocks():
             b = 134.0 + s * 22.0
             tq = bstress[i]
             cq = bstressC[i]
-            if tq > 0.03:
+            # при включённой легенде (show=1) блоки НЕ окрашиваются по шкале:
+            # цвета шкалы несут линии связей (render_bonds, scale=1)
+            if show == 0 and tq > 0.03:
                 u = tq if tq > 1.0 else tq * tq * (3.0 - 2.0 * tq)
                 r = r + (255.0 - r) * u
                 g = g + (101.0 - g) * u
                 b = b + (58.0 - b) * u
-            elif cq > 0.05:
+            elif show == 0 and cq > 0.05:
                 u = cq if cq > 1.0 else cq * cq * (3.0 - 2.0 * cq)
                 r = r + (96.0 - r) * u
                 g = g + (152.0 - g) * u
@@ -248,8 +401,158 @@ def render_blocks():
                 fill_rect(X, Y + px - 2, X + px - 1, Y + px - 1, hl)
 
 
+# =================================================== легенда напряжений (шрифт 3x5)
+# ti.ui не умеет рисовать текст в канвасе — цифры шкал рисуем пикселями:
+# глиф 3x5 (маска 15 бит), масштаб s пикселей на точку.
+
+@ti.func
+def digit_mask(d: ti.i32) -> ti.i32:
+    """Маска глифа 3x5 (15 бит, старший бит — левый верхний пиксель).
+    0..9 — цифры, 10 — точка, 11 — минус, 12..14 — буквы М, П, а (МПа)."""
+    m = 0
+    if d == 0:
+        m = 0b111101101101111
+    elif d == 1:
+        m = 0b010110010010111
+    elif d == 2:
+        m = 0b111001111100111
+    elif d == 3:
+        m = 0b111001111001111
+    elif d == 4:
+        m = 0b101101111001001
+    elif d == 5:
+        m = 0b111100111001111
+    elif d == 6:
+        m = 0b111100111101111
+    elif d == 7:
+        m = 0b111001001001001
+    elif d == 8:
+        m = 0b111101111101111
+    elif d == 9:
+        m = 0b111101111001111
+    elif d == 10:
+        m = 0b000000000000010
+    elif d == 11:
+        m = 0b000001110000000
+    elif d == 12:
+        m = 0b101111111101101   # М
+    elif d == 13:
+        m = 0b111101101101101   # П
+    else:
+        m = 0b010101111101101   # а (А-образный)
+    return m
+
+
+@ti.func
+def draw_digit(x: ti.i32, y: ti.i32, d: ti.i32, s: ti.i32, col: ti.template()):
+    """Один глиф 3x5 масштаба s; y — НИЗ глифа. Канвас img на экране идёт
+    снизу вверх (img[.,0] — низ экрана), поэтому строки глифа рисуются вверх
+    от y — текст на экране читается, а не перевёрнут."""
+    m = digit_mask(d)
+    for py in range(5):
+        for px in range(3):
+            if ((m >> (14 - (py * 3 + px))) & 1) == 1:
+                fill_rect(x + px * s, y + (4 - py) * s,
+                          x + px * s + s - 1, y + (4 - py) * s + s - 1, col)
+
+
+@ti.func
+def draw_num(x: ti.i32, y: ti.i32, val: ti.f32, s: ti.i32, col: ti.template(), dec: ti.i32):
+    """Число (МПа): целая часть + dec знаков после точки (0..2), y — низ цифр.
+    Значение округляется до dec знаков, хвостовые нули при dec=1 не пишутся."""
+    v = val
+    x0 = x
+    if v < 0.0:
+        draw_digit(x0, y, 11, s, col)
+        x0 += 4 * s
+        v = -v
+    scale = 1
+    if dec == 1:
+        scale = 10
+    elif dec == 2:
+        scale = 100
+    num = int(v * float(scale) + 0.5)   # значение в долях 1/scale
+    whole = num // scale
+    frac = num - whole * scale
+    if whole >= 100:
+        draw_digit(x0, y, (whole // 100) % 10, s, col)
+        x0 += 4 * s
+    if whole >= 10:
+        draw_digit(x0, y, (whole // 10) % 10, s, col)
+        x0 += 4 * s
+    draw_digit(x0, y, whole % 10, s, col)
+    x0 += 4 * s
+    if dec == 1 and frac != 0:
+        draw_digit(x0, y, 10, s, col)
+        x0 += 2 * s
+        draw_digit(x0, y, frac, s, col)
+    elif dec == 2:
+        draw_digit(x0, y, 10, s, col)
+        x0 += 2 * s
+        draw_digit(x0, y, (frac // 10) % 10, s, col)
+        x0 += 4 * s
+        draw_digit(x0, y, frac % 10, s, col)
+
+
 @ti.kernel
-def render_bonds(show: ti.i32):
+def render_stress_legend(rp: ti.f32, rc: ti.f32):
+    """Динамическая легенда напряжений (левый верхний угол экрана): по 10
+    цветных квадратов на шкалу — красная (растяжение) и синяя (сжатие),
+    значения в МПа от 0 до ПИКА напряжений в сцене (stressPeak), поэтому
+    числа меняются по мере роста/спада напряжений. Цвет квадрата —
+    legend_band_color: ровно тот же, что у линий связей своего интервала
+    (render_bonds). Каждый квадрат подписан верхней границей интервала.
+    Канвас: y ВВЕРХ (img[.,0] — низ экрана) — вся геометрия снизу вверх,
+    глифы рисуются от нижнего края, чтобы текст читался, а не был вверх ногами."""
+    s = 3                      # масштаб шрифта (пикселей в точке)
+    n = 10                     # квадратов (цветовых интервалов) на шкалу
+    sw_w = 18                  # квадрат: ширина
+    sw_h = 20                  # квадрат: высота
+    stack_h = n * sw_h
+    x_t = 26                   # шкала растяжения (красная)
+    x_c = 168                  # шкала сжатия (синяя)
+    y_base = H - 280           # низ стопки квадратов (y канваса вверх)
+    # подложка: числа читаются на любом фоне сцены
+    fill_rect(x_t - 10, y_base - 24, x_c + 116, y_base + stack_h + 30,
+              ti.Vector([0.05, 0.06, 0.08]))
+    for bi in range(2):
+        xb = x_t if bi == 0 else x_c
+        pk = stressPeak[0] if bi == 0 else stressPeak[1]
+        vmax = rp if bi == 0 else rc
+        if pk < 1e-4:
+            pk = 1.0            # напряжений ещё нет — шкала 0..предел прочности
+        vmax = vmax * pk
+        # над шкалой — единицы измерения: МПа (глифы 12, 13, 14)
+        wcol = ti.Vector([1.0, 1.0, 1.0])
+        draw_digit(xb, y_base + stack_h + 6, 12, s, wcol)
+        draw_digit(xb + 4 * s, y_base + stack_h + 6, 13, s, wcol)
+        draw_digit(xb + 8 * s, y_base + stack_h + 6, 14, s, wcol)
+        for k in range(n):
+            col = legend_band_color(bi, k)
+            y0 = y_base + k * sw_h
+            fill_rect(xb, y0, xb + sw_w - 1, y0 + sw_h - 2, col)
+            # подпись: верхняя граница интервала (МПа). Точность подбирается так,
+            # чтобы значения не сливались и не «прыгали» после округления:
+            # <10 МПа — два знака (0.45, 0.89...), 10..100 — один (4.5, 9, 13.5...),
+            # >=100 — целые (15, 30...). Раньше всё >=10 округлялось до целых,
+            # и шкала сжатия (часто 10..100 МПа) давала рваный ряд 5, 9, 14, 18...
+            dec = 2
+            if vmax >= 10.0:
+                dec = 1
+            if vmax >= 100.0:
+                dec = 0
+            draw_num(xb + sw_w + 6, y0 + (sw_h - 5 * s) // 2,
+                     vmax * float(k + 1) / float(n), s, wcol, dec)
+        # ноль — под стопкой квадратов
+        draw_num(xb + sw_w + 6, y_base - 17, 0.0, s, wcol, 0)
+
+
+@ti.kernel
+def render_bonds(show: ti.i32, scale: ti.i32):
+    """Линии напряжений по связям (внутри блоков): растяжение — красная шкала,
+    сжатие — синяя. При scale=1 (легенда включена) цвет линии — цвет интервала
+    legend_band_color её напряжения, ровно как квадрат на шкале легенды;
+    иначе обычные оранжевый/синий."""
     if show == 1:
         z = CAMZ[None]
         ox = CAMX[None]
@@ -260,11 +563,19 @@ def render_bonds(show: ti.i32):
                 a = bondA[bd]
                 b = bondB[bd]
                 if r > 0.12:
+                    # растяжение: r = F/Ftmax — та же нормировка, что bstress
+                    col = ORANGE
+                    if scale == 1:
+                        col = legend_band_color(0, stress_band(r, stressPeak[0]))
                     draw_line(bx[a] * PX * z + ox, H - 1 - (by[a] * PX * z + oy),
-                              bx[b] * PX * z + ox, H - 1 - (by[b] * PX * z + oy), ORANGE, 2.0)
+                              bx[b] * PX * z + ox, H - 1 - (by[b] * PX * z + oy), col, 2.0)
                 elif r < -0.12:
+                    # сжатие: r = F/(Fcmax*0.25), значит -F/Fcmax = -r*0.25 — как bstressC
+                    col = BLUE
+                    if scale == 1:
+                        col = legend_band_color(1, stress_band(-r * 0.25, stressPeak[1]))
                     draw_line(bx[a] * PX * z + ox, H - 1 - (by[a] * PX * z + oy),
-                              bx[b] * PX * z + ox, H - 1 - (by[b] * PX * z + oy), BLUE, 2.0)
+                              bx[b] * PX * z + ox, H - 1 - (by[b] * PX * z + oy), col, 2.0)
 
 
 @ti.kernel
@@ -612,9 +923,9 @@ def gen_solid():
         a = r_block[c]
         if a >= 0:
             if (c % COLS) < COLS - 1 and r_block[c + 1] >= 0:
-                add_bond_func(a, r_block[c + 1], 1.0, 1)
+                add_bond_func(a, r_block[c + 1], 1.0, 1 if cutR[c] == 0 else 0)
             if (c // COLS) < ROWS - 1 and r_block[c + COLS] >= 0:
-                add_bond_func(a, r_block[c + COLS], 1.0, 1)
+                add_bond_func(a, r_block[c + COLS], 1.0, 1 if cutD[c] == 0 else 0)
         c += 1
 
 
@@ -770,7 +1081,11 @@ def build_bigblocks():
                     continue
                 dx = blocks[a1][0] - blocks[a0][0]
                 dy = blocks[a1][1] - blocks[a0][1]
-                rest = abs(dx) if abs(dx) >= abs(dy) else abs(dy)
+                # длина покоя — ИСТИННОЕ расстояние между центрами (в клетках,
+                # add_bond_func переведёт в метры): max-ось занижала его у пар
+                # «большой+малый» блок (смещение центров диагональное), связь
+                # создавалась НАТЯНУТОЙ и рвалась лишний раз.
+                rest = math.sqrt(dx * dx + dy * dy)
                 bonds.append((a0, a1, rest, 1))
                 seen.add((a0, a1))
     water = []
@@ -791,19 +1106,29 @@ def generate(mode, weak, tilt_deg=0.0):
     tilt_deg — НАКЛОН СЛОЁВ к горизонтали (градусы, + = падение вправо):
     применяется к сцене «выработка» и к «Заполнить массив»; гравитация и
     давление вышележащих пород остаются вертикальными (см. gen_tilted)."""
+    global model_angle
+    model_angle = 0.0      # новая сцена — ориентация "как сгенерирована"
     if mode == 2:
         build_bigblocks()
-        return
-    reset_all()
-    refillOff[None] = 0   # новая сцена — досыпка сверху снова включена
-    if mode == 0:
-        if abs(tilt_deg) > 0.5:
-            t = math.radians(tilt_deg)
-            gen_tilted(weak, math.cos(t), math.sin(t), 1)
-        else:
-            gen_tunnel(weak)
     else:
-        gen_slope(weak)
+        reset_all()
+        refillOff[None] = 0   # новая сцена — досыпка сверху снова включена
+        if mode == 0:
+            if abs(tilt_deg) > 0.5:
+                t = math.radians(tilt_deg)
+                gen_tilted(weak, math.cos(t), math.sin(t), 1)
+            else:
+                gen_tunnel(weak)
+        else:
+            gen_slope(weak)
+    # Престресс горизонтальных связей: σ_h = K0·σ_v заложен в связи сразу после сборки
+    # (см. update_prestress). Перегруз loadCur ставим как в compute_top_load_fused,
+    # чтобы σ_v включал вес вышележащих пород (иначе престресс был бы без перегруза).
+    # Дальше update_prestress зовётся КАЖДЫЙ тик в step_physics — усилие связей
+    # динамически следует за глубиной/K0, меняющимися в рантайме.
+    loadCur[None] = (P[None].depth * LOAD_OVER) if mode == 0 else 0.0
+    refresh_field()
+    update_prestress(DT)
 
 
 @ti.kernel
@@ -933,10 +1258,11 @@ def clear_scene():
             axx = ti.abs(dx)
             ayy = ti.abs(dy)
             rs = ri + rj
+            # rest — в КЛЕТКАХ (add_bond_func умножает на LCELL): метры / LCELL
             if axx > rs - 0.05 * LCELL and axx < rs + 0.05 * LCELL and ayy < ti.min(ri, rj):
-                add_bond_func(i, j, ti.sqrt(dx * dx + dy * dy), 1)
+                add_bond_func(i, j, ti.sqrt(dx * dx + dy * dy) / LCELL, 1)
             elif ayy > rs - 0.05 * LCELL and ayy < rs + 0.05 * LCELL and axx < ti.min(ri, rj):
-                add_bond_func(i, j, ti.sqrt(dx * dx + dy * dy), 1)
+                add_bond_func(i, j, ti.sqrt(dx * dx + dy * dy) / LCELL, 1)
             j += 1
         i += 1
     pCount[None] = 0
@@ -979,34 +1305,30 @@ def dust_compact():
 # ================================================================== ввод
 # курсор окна (нормализованные координаты) -> координаты КЛЕТОК модели
 def cursor_to_cells(pos):
-    k = CELL * CAMZ[None]
+    k = CELL * _CAM[2]
     sx = pos[0] * W
     sy = pos[1] * H
-    mx = (sx - CAMX[None]) / k
-    my = (H - 1.5 - sy - CAMY[None]) / k
+    mx = (sx - _CAM[0]) / k
+    my = (H - 1.5 - sy - _CAM[1]) / k
     return mx, my
 
 
-# колёсико/кнопки: зум с сохранением точки, на которую смотрим (под курсором)
+# зум мышью: масштабируется к точке под курсором, чтобы она осталась на месте
 def zoom_at(pos, factor):
-    z0 = CAMZ[None]
+    z0 = _CAM[2]
     z1 = min(CAM_ZMAX, max(CAM_ZMIN, z0 * factor))
     if z1 == z0:
         return
     sx = pos[0] * W
     sy = pos[1] * H
-    wx = (sx - CAMX[None]) / (PX * z0)
-    wy = (H - 1.5 - sy - CAMY[None]) / (PX * z0)
+    wx = (sx - _CAM[0]) / (PX * z0)
+    wy = (H - 1.5 - sy - _CAM[1]) / (PX * z0)
     k = PX * z1
-    CAMX[None] = sx - wx * k
-    CAMY[None] = H - 1.5 - sy - wy * k
-    CAMZ[None] = z1
+    cam_write(sx - wx * k, H - 1.5 - sy - wy * k, z1)
 
 
 def reset_camera():
-    CAMZ[None] = 1.0
-    CAMX[None] = 0.0
-    CAMY[None] = 0.0
+    cam_write(0.0, 0.0, 1.0)
 
 
 def do_stroke(mx, my, last_mx, last_my, tool, brush):
@@ -1115,20 +1437,24 @@ def run_selftest(frames=120):
     t0 = time.perf_counter()
     render_base()
     render_triangles(0.0, 1)
-    render_blocks()
+    stress_peaks()
+    render_blocks(1)
     render_joints()
-    render_bonds(1)
+    render_bonds(1, 1)
     render_cracks()
     render_water()
     render_dust()
     render_sources(0.0)
     render_mouse(-999.0, 0.0, 2.0, 0)
+    hud_gather()
+    render_stress_legend(hudF[HUD_RP], hudF[HUD_RP] * hudF[HUD_RCFACTOR])
     t_render = time.perf_counter() - t0
     print("selftest: one render pass in %.1f ms" % (t_render * 1000.0))
     print("selftest OK")
 
 
 def run_gui():
+    global model_angle
     apply_gravity(1.0)
     apply_rock(10.0, 4.0, 0.62)
     apply_water(12.0)
@@ -1169,19 +1495,34 @@ def run_gui():
     cam_drag = False          # зажата средняя кнопка — таскаем камеру
     cam_prev = (0.0, 0.0)     # курсор прошлого кадра (для дельты драга)
     seen_keys = set()         # диагностика неизвестных событий ввода (в консоль)
-    tilt_input = False        # режим ввода числа: наклон слоёв (цифры + Enter)
-    tilt_buf = ""             # буфер вводимого угла
+    ang_focus = 1             # какое поле угла принимает цифры: 0 = слои, 1 = модель (Tab)
+    buf_sloi = ""             # буфер набора угла слоёв, град
+    buf_model = ""            # буфер набора угла модели, град
+    model_angle = 0.0         # текущий угол модели к горизонту, град (0 = как сгенерирована)
+    legend_on = False         # легенда напряжений (кнопка под START)
 
     while window.running:
         now = time.perf_counter()
         dt_real = min(0.05, now - last)
         last = now
-        t_sim = simT[None]     # внутреннее время симуляции (сек, дробное)
+        # снимок HUD одним ядром + одним копированием на кадр (вместо двух
+        # десятков read'ов скаляров — каждый read был синхронизацией CPU<->GPU)
+        hud = hud_snapshot()
+        t_sim = hud[HUD_SIMT]     # внутреннее время симуляции (сек, дробное)
 
         try:
             # один проход по ВСЕМ событиям (колесо — не типа PRESS, отдельный
             # фильтр его теряет). Отпускание кнопки/клавиши отличаем от нажатия
             # через window.is_pressed(k): у события отпуска is_pressed == False.
+            # символы числа (цифры/минус/точка) — опросом клавиатуры: события
+            # ti.ui их не приносят (см. poll_type_chars)
+            for ch in poll_type_chars():
+                if ang_focus == 0:
+                    if len(buf_sloi) < 8:
+                        buf_sloi += ch
+                else:
+                    if len(buf_model) < 8:
+                        buf_model += ch
             for e in window.get_events():
                 k = e.key
                 if k == "Wheel" or k == "WHEEL":
@@ -1197,63 +1538,66 @@ def run_gui():
                         f = 1.15 if dy > 0 else 1.0 / 1.15
                         zoom_at(pos, f)
                     continue
-                if tilt_input:
-                    # режим ввода угла наклона: цифры, знак, точка/запятая; Enter —
-                    # применить (перегенерация сцены), Esc — отмена. Все остальные
-                    # клавиши игнорируются, чтобы ввод не переключал инструменты.
-                    if k == ti.ui.RETURN:
-                        try:
-                            tv = float(tilt_buf.replace(",", "."))
-                        except ValueError:
-                            tv = None
+                if k == ti.ui.TAB:
+                    # Tab — какое поле угла получает цифры (сами символы приходят
+                    # из poll_type_chars: события ti.ui цифры/минус/точку не дают)
+                    ang_focus = 1 - ang_focus
+                    continue
+                if k == ti.ui.RETURN:
+                    if ang_focus == 0:
+                        tv = parse_deg(buf_sloi)
                         if tv is None or tv < -45.0 or tv > 45.0:
-                            flash_msg = "Naklon: nuzhno chislo ot -45 do 45 (vvedeno %r)" % tilt_buf
+                            flash_msg = "Ugol sloev: nuzhno chislo ot -45 do 45"
                         else:
                             tilt_deg = tv
                             srcCount[None] = 0
                             generate(mode, weak, tilt_deg)
+                            model_angle = 0.0
                             flash_msg = ("Naklon sloev %g grad: sloi pod uglom, "
                                          "g i nagruzka sverhu - vertikalno" % tilt_deg)
+                            buf_sloi = ""
                         flash_wall = now
-                        tilt_input = False
-                        tilt_buf = ""
-                        continue
-                    if k == ti.ui.ESCAPE:
-                        tilt_input = False
-                        tilt_buf = ""
-                        flash_msg = "Vvod naklona otmenyon"
+                    else:
+                        tv = parse_deg(buf_model)
+                        if tv is None or tv < -180.0 or tv > 180.0:
+                            flash_msg = "Ugol modeli: nuzhno chislo ot -180 do 180"
+                        else:
+                            d = math.radians(tv - model_angle)
+                            if abs(d) > 1e-9:
+                                rotate_model(d, COLS * LCELL * 0.5, ROWS * LCELL * 0.5)
+                                model_angle = tv
+                                flash_msg = "Model povernuta na %g grad (g vertikalno)" % tv
+                            buf_model = ""
                         flash_wall = now
-                        continue
-                    if k == ti.ui.BACKSPACE:
-                        tilt_buf = tilt_buf[:-1]
-                        continue
-                    if k in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-                             "-", "+", ".", ","):
-                        if len(tilt_buf) < 7:
-                            tilt_buf += k
-                        continue
-                    continue    # прочие клавиши в режиме ввода игнорируем
-                if k == ti.ui.ESCAPE:
-                    window.running = False
                     continue
-                if k not in (ti.ui.SPACE, "0", "1", "2", "3", "4",
-                             ti.ui.LMB, ti.ui.RMB, ti.ui.MMB):
+                if k == ti.ui.ESCAPE:
+                    if buf_sloi or buf_model:
+                        buf_sloi = ""
+                        buf_model = ""
+                        flash_msg = "Vvod ugla otmenyon"
+                        flash_wall = now
+                    else:
+                        window.running = False
+                    continue
+                if k == ti.ui.BACKSPACE:
+                    if ang_focus == 0:
+                        buf_sloi = buf_sloi[:-1]
+                    else:
+                        buf_model = buf_model[:-1]
+                    continue
+                if k not in (ti.ui.SPACE, "c", ti.ui.LMB, ti.ui.RMB, ti.ui.MMB):
                     if k not in seen_keys:
                         seen_keys.add(k)
                         print("input: neizvestnoye sobytiye key=%r delta=%r" % (k, getattr(e, "delta", None)))
                     continue
                 if not window.is_pressed(k):
-                    continue          # событие отпуска кнопки/клавиши — игнор
+                    continue
                 if k == ti.ui.SPACE:
                     paused = not paused
-                elif k in ("1", "2", "3", "4"):
-                    tool = int(k) - 1
-                elif k == "0":
+                elif k == "c":
                     reset_camera()
-                    pos = window.get_cursor_pos()
-                    if pos[0] <= 0.71:
-                        flash_msg = "Kamera sbroshena"
-                        flash_wall = now
+                    flash_msg = "Kamera sbroshena"
+                    flash_wall = now
                 elif k == ti.ui.LMB:
                     pos = window.get_cursor_pos()
                     mx, my = cursor_to_cells(pos)
@@ -1297,8 +1641,9 @@ def run_gui():
         if cam_drag and window.is_pressed(ti.ui.MMB):
             pos = window.get_cursor_pos()
             if pos[0] <= 0.71:
-                CAMX[None] += pos[0] * W - cam_prev[0] * W
-                CAMY[None] -= pos[1] * H - cam_prev[1] * H
+                cam_write(_CAM[0] + pos[0] * W - cam_prev[0] * W,
+                          _CAM[1] - pos[1] * H - cam_prev[1] * H,
+                          _CAM[2])
                 cam_prev = pos
         else:
             cam_drag = False
@@ -1311,41 +1656,63 @@ def run_gui():
             paused = not paused
             flash_msg = "Симуляция запущена" if not paused else "Пауза"
             flash_wall = now
-        gui.text("Vremya simulyatsii: %.3f s" % simT[None])
+        # под START — переключатель легенды напряжений
+        if gui.button("Skryt legendu" if legend_on else "Pokazat legendu"):
+            legend_on = not legend_on
+        if legend_on:
+            pkT = hud[HUD_PEAKT] if hud[HUD_PEAKT] > 1e-4 else 1.0
+            pkC = hud[HUD_PEAKC] if hud[HUD_PEAKC] > 1e-4 else 1.0
+            gui.text("Legenda: 10 intervalov cveta, 0..pik napryazheniy")
+            gui.text("Krasnaya shkala - rastyazhenie: 0..%.1f MPa" % (hud[HUD_RP] * pkT))
+            gui.text("Sinyaya shkala - szhatie: 0..%.1f MPa" % (hud[HUD_RP] * hud[HUD_RCFACTOR] * pkC))
+        gui.text("Vremya simulyatsii: %.3f s" % t_sim)
         gui.text("Scena: %s" % scene_names[mode])
         gui.text("Naklon sloev: %g grad (g - vertikalno)" % tilt_deg)
-        gui.text("Poroda: E=%d GPa, Rt=%d MPa, Rc=%d MPa" % (E_GPa, int(P[None].rp), int(P[None].rp * P[None].rcFactor)))
-        gui.text("Napor: %.2f MPa na porodu" % (RHO_W * G_PHYS * P[None].head / 1e6))
+        gui.text("Poroda: E=%d GPa, Rt=%d MPa, Rc=%d MPa" % (E_GPa, int(hud[HUD_RP]), int(hud[HUD_RP] * hud[HUD_RCFACTOR])))
+        gui.text("Napor: %.2f MPa na porodu" % (RHO_W * G_PHYS * hud[HUD_HEAD] / 1e6))
         gui.text("LKM - instrument * PKM - istochnik")
         gui.text("SKM - peretaskivanie * Koleso - zum")
-        if gui.button("Poroda (1)"):
+        if gui.button("Poroda"):
             tool = 0
-        if gui.button("Treshchina (2)"):
+        if gui.button("Treshchina"):
             tool = 1
-        if gui.button("Istochnik vody (3)"):
+        if gui.button("Istochnik vody"):
             tool = 2
-        if gui.button("Lastik (4)"):
+        if gui.button("Lastik"):
             tool = 3
         brush = gui.slider_int("Kist", brush, 1, 6)
         E_new = gui.slider_int("Modul E, GPa", E_GPa, 1, 20)
-        rp_new = gui.slider_int("Rp (otriv) MPa", int(P[None].rp), 1, 15)
-        mu_new = gui.slider_int("Trenie mu %%", int(P[None].mu * 100), 20, 90)
-        if E_new != E_GPa or rp_new != int(P[None].rp) or mu_new != int(P[None].mu * 100):
+        rp_new = gui.slider_int("Rp (otriv) MPa", int(hud[HUD_RP]), 1, 15)
+        mu_new = gui.slider_int("Trenie mu %%", int(hud[HUD_MU] * 100), 20, 90)
+        if E_new != E_GPa or rp_new != int(hud[HUD_RP]) or mu_new != int(hud[HUD_MU] * 100):
             E_GPa = E_new
             apply_rock(E_GPa, float(rp_new), mu_new / 100.0, rho)
-        P[None].depth = gui.slider_int("Poroda nad skhemoy, m", int(P[None].depth), 0, 3000)
+        depth_new = gui.slider_int("Poroda nad skhemoy, m", int(hud[HUD_DEPTH]), 0, 3000)
+        if depth_new != int(hud[HUD_DEPTH]):
+            P[None].depth = depth_new
         rho_new = gui.slider_int("Plotnost porody, kg/m3", int(rho), 1000, 3500)
         if rho_new != rho:
             rho = float(rho_new)
-            apply_rock(E_GPa, float(P[None].rp), P[None].mu, rho)
-            apply_water(P[None].head)
-        P[None].k0 = gui.slider_float("K0 bokovogo davleniya", P[None].k0, 0.0, 2.0)
-        P[None].fixedRows = gui.slider_int("Zakrepl. ryadov", P[None].fixedRows, 1, 4)
-        P[None].brkCap = gui.slider_int("Limit razryvov/tik", P[None].brkCap, 1, 200)
-        P[None].dmgMax = gui.slider_int("Tr. povrezhdeniya, tik", int(P[None].dmgMax), 1, 60)
-        P[None].plastFlow = gui.slider_float("Skor. plast. techeniya, 1/s", P[None].plastFlow, 0.0, 1.0)
-        walls = gui.checkbox("Bokovye stenki", P[None].walls == 1)
-        P[None].walls = 1 if walls else 0
+            apply_rock(E_GPa, float(hud[HUD_RP]), hud[HUD_MU], rho)
+            apply_water(hud[HUD_HEAD])
+        k0_new = gui.slider_float("K0 bokovogo davleniya", hud[HUD_K0], 0.0, 2.0)
+        if k0_new != hud[HUD_K0]:
+            P[None].k0 = k0_new
+        fr_new = gui.slider_int("Zakrepl. ryadov", int(hud[HUD_FIXEDROWS]), 1, 4)
+        if fr_new != int(hud[HUD_FIXEDROWS]):
+            P[None].fixedRows = fr_new
+        bc_new = gui.slider_int("Limit razryvov/tik", int(hud[HUD_BRKCAP]), 1, 200)
+        if bc_new != int(hud[HUD_BRKCAP]):
+            P[None].brkCap = bc_new
+        dm_new = gui.slider_int("Tr. povrezhdeniya, tik", int(hud[HUD_DMGMAX]), 1, 60)
+        if dm_new != int(hud[HUD_DMGMAX]):
+            P[None].dmgMax = dm_new
+        pf_new = gui.slider_float("Skor. plast. techeniya, 1/s", hud[HUD_PLASTFLOW], 0.0, 1.0)
+        if pf_new != hud[HUD_PLASTFLOW]:
+            P[None].plastFlow = pf_new
+        walls = gui.checkbox("Bokovye stenki", hud[HUD_WALLS] == 1)
+        if walls != (hud[HUD_WALLS] == 1):
+            P[None].walls = 1 if walls else 0
         weak_new = gui.checkbox("Oslablennye ploskosti", weak == 1)
         if weak_new != weak:
             weak = 1 if weak_new else 0
@@ -1353,17 +1720,19 @@ def run_gui():
             generate(mode, weak, tilt_deg)
             flash_msg = "Massiv %s: svyazey %d" % ("oslablen" if weak else "monolitny", count_intact())
             flash_wall = now
-        # наклон слоёв — ввод ЧИСЛОМ с клавиатуры (в таичи 1.7 нет input_text):
-        # кнопка открывает режим ввода, цифры/знак/точка набираются, Enter — применить
-        if gui.button("Naklon sloev: %g grad - vvest chislom" % tilt_deg):
-            tilt_input = True
-            tilt_buf = ""
-            flash_msg = "Ugol naklona: vvedite chislo ot -45 do 45 i nazhmite Enter (Esc - otmena)"
-            flash_wall = now
-        if tilt_input:
-            gui.text("Vvod naklona: [ %s ]  Enter - prinat, Esc - otmena" % tilt_buf)
-        gv = gui.slider_int("Gravitatsiya x0.1g", int(P[None].g / G_PHYS * 10.0), 0, 20)
-        apply_gravity(gv / 10.0)
+        # угол модели — поворот СОБРАННОЙ модели; угол слоёв — перегенерация
+        # с наклонными слоями; в обоих случаях сила тяжести остаётся вертикальной.
+        # угол — просто СТРОКИ набора числа (кнопка не нужна): цифры/знак/точка
+        # пишутся в активное поле сразу (символы читает poll_type_chars — события
+        # ti.ui цифры не приносят), Tab — переключить поле, Enter — применить,
+        # BackSpace — удалить, Esc — очистить буферы.
+        gui.text("Ugol modeli k horizontu, grad (seychas %g):" % model_angle)
+        gui.text("  [ %s ]%s   Tab - pole, Enter - primenit" % (buf_model, "_" if ang_focus == 1 else ""))
+        gui.text("Ugol sloev k horizontu, grad (seychas %g):" % tilt_deg)
+        gui.text("  [ %s ]%s   peresozdaet scenu, g vertikalno" % (buf_sloi, "_" if ang_focus == 0 else ""))
+        gv = gui.slider_int("Gravitatsiya x0.1g", int(hud[HUD_G] / G_PHYS * 10.0), 0, 20)
+        if gv != int(hud[HUD_G] / G_PHYS * 10.0):
+            apply_gravity(gv / 10.0)
         if gui.button("Vyrabotka"):
             if mode != 0:
                 mode = 0
@@ -1403,11 +1772,14 @@ def run_gui():
             flash_wall = now
         if gui.button("Ochistit porodu"):
             clear_scene()
+            model_angle = 0.0
             refillOff[None] = 1   # запретить досыпку обломков сверху
             flash_msg = "Poroda ubrana"
             flash_wall = now
         show_bonds = 1 if gui.checkbox("Pokazyvat svyazi", show_bonds == 1) else 0
-        apply_water(float(gui.slider_int("Napor H, m", int(P[None].head), 1, 40)))
+        head_new = gui.slider_int("Napor H, m", int(hud[HUD_HEAD]), 1, 40)
+        if head_new != int(hud[HUD_HEAD]):
+            apply_water(float(head_new))
         if gui.button("Slit vodu"):
             pCount[None] = 0
             filledFlag[None] = 0
@@ -1422,12 +1794,12 @@ def run_gui():
             if not paused:
                 flash_msg = "Симуляция запущена"
             flash_wall = now
-        fp = fill_pct()
-        gui.text("fps %.0f * blokov %d" % (fps, bcount[None]))
-        gui.text("chastits h2o %d%s * svyazey %d" % (pCount[None], " (MAX)" if pCount[None] >= PMAX else "", count_intact()))
-        gui.text("razryvov %d * zapolnenie %.0f%%" % (broken[None], fp))
-        gui.text("Energiya: E=%.1e J (K=%.1e, P=%.1e)" % (energyTotal[None], energyKin[None], energyPot[None]))
-        gui.text("Centr tyazhesti: x=%.2f, y=%.2f m, massa=%.0f kg" % (comX[None], comY[None], comMass[None]))
+        fp = hud[HUD_FILL]
+        gui.text("fps %.0f * blokov %d" % (fps, int(hud[HUD_BCOUNT])))
+        gui.text("chastits h2o %d%s * svyazey %d" % (int(hud[HUD_PCOUNT]), " (MAX)" if hud[HUD_PCOUNT] >= PMAX else "", int(hud[HUD_INTACT])))
+        gui.text("razryvov %d * zapolnenie %.0f%%" % (int(hud[HUD_BROKEN]), fp))
+        gui.text("Energiya: E=%.1e J (K=%.1e, P=%.1e)" % (hud[HUD_ETOT], hud[HUD_EKIN], hud[HUD_EPOT]))
+        gui.text("Centr tyazhesti: x=%.2f, y=%.2f m, massa=%.0f kg" % (hud[HUD_COMX], hud[HUD_COMY], hud[HUD_COMASS]))
         if flash_msg and (now - flash_wall < 2.0):
             gui.text(flash_msg)
         gui.end()
@@ -1442,28 +1814,30 @@ def run_gui():
                 rx = 1.0 + (math.sin(t_sim * 13.7) * 0.5 + 0.5) * (COLS - 2)
                 spawn_water(2, 1.8 * LCELL, rx, 1.2, PI * 0.5)
             step_physics(mode)
-            t_sim = simT[None]
+            t_sim += TICK
+            hud[HUD_SIMT] = t_sim
             dust_step()
             dust_compact()
-            if broken[None] != last_broken:
-                if broken[None] % 8 == 1:
-                    flash_msg = "Smyatie porody (Rc)" if breakCrush[None] == 1 else "Razryv svyazi (Rp)"
+            if int(hud[HUD_BROKEN]) != last_broken:
+                if int(hud[HUD_BROKEN]) % 8 == 1:
+                    flash_msg = "Smyatie porody (Rc)" if hud[HUD_CRUSH] == 1 else "Razryv svyazi (Rp)"
                     flash_wall = now
-                last_broken = broken[None]
-            if filledFlag[None] == 0 and fp >= 95:
+                last_broken = int(hud[HUD_BROKEN])
+            if hud[HUD_FILLFLAG] == 0 and fp >= 95:
                 filledFlag[None] = 1
                 flash_msg = "Vyrabotka zapolnena vodoy"
                 flash_wall = now
         else:
-            if last_broken != broken[None]:
-                last_broken = broken[None]
+            if last_broken != int(hud[HUD_BROKEN]):
+                last_broken = int(hud[HUD_BROKEN])
 
         # ---- отрисовка
         render_base()
-        render_triangles(t_sim, 1 if (mode == 0 and P[None].depth > 0) else 0)
-        render_blocks()
+        render_triangles(t_sim, 1 if (mode == 0 and hud[HUD_DEPTH] > 0) else 0)
+        stress_peaks()   # пики напряжений — динамическая шкала легенды
+        render_blocks(1 if legend_on else 0)
         render_joints()
-        render_bonds(show_bonds)
+        render_bonds(show_bonds, 1 if legend_on else 0)
         render_cracks()
         render_water()
         render_dust()
@@ -1476,6 +1850,8 @@ def run_gui():
         else:
             render_mouse(-999.0, 0.0, brush, 0)
 
+        if legend_on:
+            render_stress_legend(hud[HUD_RP], hud[HUD_RP] * hud[HUD_RCFACTOR])
         canvas.set_image(img)
         window.show()
 

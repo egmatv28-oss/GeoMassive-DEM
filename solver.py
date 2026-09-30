@@ -86,12 +86,13 @@ def apply_water(head_m):
     P[None].kw = WSPR
     P[None].wCap = WPRESS * head_m
     P[None].head = head_m
-@ti.kernel
-def phys_integrate(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32, drotBond: ti.f32):
-    # моменты качания на полу и тормоз перекатывания (forces_rock) считаются
-    # первыми, прямо перед интегрированием: им нужны supp/comIn/cnck, которые
-    # только что собрал контакт того же подшага. Слитое ядро = минус один лаунч.
-    forces_rock()
+@ti.func
+def forces_integrate(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32, drotBond: ti.f32):
+    """Интегрирование подшага: скорости из сил, демпфирование, вращение, позиции.
+
+    Бывшее тело ядра phys_integrate, вынесено @ti.func, чтобы phys_substep
+    выполнял его в ОДНОМ лаунче с силами. Перед ним идёт forces_rock: его
+    моментам нужны supp/comIn/cnck, которые только что собрал контакт подшага."""
     walls = P[None].walls
     for i in range(bcount[None]):
         if bfixed[i] == 1:
@@ -197,6 +198,35 @@ def phys_integrate(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32, d
             by[i] = ROWS * LCELL - rx
             if bvy[i] > 0.0:
                 bvy[i] *= 1.0 - damp
+
+
+@ti.kernel
+def phys_integrate(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32, drotBond: ti.f32):
+    """Ядро-обёртка (совместимость/отладка): качание + интегрирование."""
+    forces_rock()
+    forces_integrate(dt, dfree, dsupp, drotFree, drotBond)
+
+
+@ti.kernel
+def phys_substep(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32, drotBond: ti.f32):
+    """Весь подшаг ЦЕЛИКОМ ОДНИМ лаунчем: поле напряжений -> силы -> качание ->
+    интегрирование. Один запуск ядра на подшаг вместо двух (исторически пяти):
+    при 192 подшагах это сотни лишних сабмитов в секунду — они держали CPU в
+    очереди драйвера, а GPU простаивал между маленькими ядрами.
+
+    Порядок внутри: sigvi_field (свежий sigVI) -> forces_zero (обнуление
+    аккумуляторов) -> forces_contact (контакты + флаги граней) -> forces_reset
+    (базовые силы читают свежие флаги) -> forces_bonds (связи) -> forces_rock
+    (моменты по свежим supp/comIn/cnck) -> forces_integrate."""
+    sigvi_field()
+    forces_zero()
+    forces_contact(dt)
+    forces_reset()
+    forces_bonds(dt)
+    forces_rock()
+    forces_integrate(dt, dfree, dsupp, drotFree, drotBond)
+
+
 @ti.kernel
 def count_bonds():
     for i in range(bcount[None]):
@@ -291,39 +321,54 @@ def refill_top_overburden(mode: ti.i32):
     досыпаны обломки в соседние колонки — они связываются между собой (если
     рядом). Так обрушение сверху просто приносит новые блоки вниз, как кучу
     породы в шахте."""
+    on = 0
     if mode == 0 and refillOff[None] == 0:
-        c = 0
-        while c < COLS:
-            newRubble[c] = -1
-            c += 1
-        # 1. находим верхний блок каждой колонки и досыпаем при пустой верхней клетке
-        c = 0
-        while c < COLS:
+        on = 1
+    # 1. находим верхний блок каждой колонки — ПАРАЛЛЕЛЬНО по колонкам.
+    #    (раньше весь проход был сплошным while на ОДНОМ потоке GPU:
+    #    O(COLS*blocks) серийно = ~32 мс/тик в одиночном ядре — главная
+    #    статья времени GPU при «простаивающем» виде. ВАЖНО: for должен быть
+    #    на ВЕРХНЕМ уровне ядра — цикл внутри if тайчи демотирует в serial.
+    #    Спавн и связывание ниже остаются серийными: add_block_func не атомарен
+    #    по bcount, но там всего O(COLS) работы.)
+    for col in range(COLS):
+        newRubble[col] = -1
+        if on == 1:
             best = -1
             bestY = 1e9
+            nb = bcount[None]
             i = 0
-            while i < bcount[None]:
+            while i < nb:
                 cc = clamp_cell(bx[i])
-                if cc == c and by[i] < bestY:
+                if cc == col and by[i] < bestY:
                     bestY = by[i]
                     best = i
                 i += 1
             # верхняя клетка (y=0) свободна, если в колонке вообще нет блока,
-            # либо самый верхний блок опустился ниже неё (координаты в м)
+            # либо самый верхний блок опустился ниже неё (координаты в м);
+            # -2 = «нужен спавн», реальный индекс заполнит серийный проход ниже
             if best < 0 or bestY >= LCELL:
-                j = add_block_func(c + 0.5, 0.5, 1.0, 0)
-                if j >= 0:
-                    newRubble[c] = j
-            c += 1
-        # 2. связываем только новые обломки соседних колонок (старые не трогаем)
-        c = 0
-        while c < COLS:
+                newRubble[col] = -2
+    # 2. досыпаем блоки в колонки с пустой верхней клеткой (серийно)
+    c = 0
+    while c < COLS:
+        if on == 1 and newRubble[c] == -2:
+            j = add_block_func(c + 0.5, 0.5, 1.0, 0)
+            if j >= 0:
+                newRubble[c] = j
+            else:
+                newRubble[c] = -1
+        c += 1
+    # 3. связываем только новые обломки соседних колонок (старые не трогаем)
+    c = 0
+    while c < COLS:
+        if on == 1:
             a = newRubble[c]
             if a >= 0 and c + 1 < COLS:
                 b = newRubble[c + 1]
                 if b >= 0:
                     add_bond_func(a, b, 1.0, 1)
-            c += 1
+        c += 1
 
 
 def compute_top_load(mode):
@@ -709,6 +754,7 @@ def reset_all():
     for bd in range(MAXBONDS):
         bondIntact[bd] = 0
         bondE[bd] = 0.0
+        bpre[bd] = 0.0
         bondPlast[bd] = 0.0
         bondSlip[bd] = 0.0
         bondFlow[bd] = 0
@@ -772,6 +818,68 @@ def build_model(blocks, bonds, water, cavity):
         _load_bonds(np.asarray(bonds, dtype=np.float32))
     if water:
         _load_water(np.asarray(water, dtype=np.float32))
+
+
+@ti.kernel
+def rotate_model(angle: ti.f32, px: ti.f32, py: ti.f32):
+    """Жёсткий поворот СОБРАННОЙ модели на angle (радиан) вокруг точки (px, py).
+
+    Поворачивается только геометрия модели: блоки (позиции/скорости/углы),
+    вода, пыль, источники, центр полости. СИЛА ТЯЖЕСТИ И ПЕРЕГРУЗ ОСТАЮТСЯ
+    СТРОГО ВЕРТИКАЛЬНЫМИ, пол и стены домена — мировыми (горизонтальными):
+    наклонённая модель «лежит» на горизонтальной границе под вертикальным g.
+    Связи не трогаем: поворот — изометрия, brest/энергии корректны. Пружины
+    трения (fricS) сбрасываем — тангенциальные упругие сдвиги накоплены в
+    старой ориентации и после поворота дали бы ложный импульс."""
+    ct = ti.cos(angle)
+    st = ti.sin(angle)
+    for i in range(bcount[None]):
+        dx = bx[i] - px
+        dy = by[i] - py
+        bx[i] = px + dx * ct - dy * st
+        by[i] = py + dx * st + dy * ct
+        vx = bvx[i]
+        vy = bvy[i]
+        bvx[i] = vx * ct - vy * st
+        bvy[i] = vx * st + vy * ct
+        brot[i] += angle
+        dxh = hx[i] - px
+        dyh = hy[i] - py
+        hx[i] = px + dxh * ct - dyh * st
+        hy[i] = py + dxh * st + dyh * ct
+    for j in range(pCount[None]):
+        dx = wx[j] - px
+        dy = wy[j] - py
+        wx[j] = px + dx * ct - dy * st
+        wy[j] = py + dx * st + dy * ct
+        dxp = wpx[j] - px
+        dyp = wpy[j] - py
+        wpx[j] = px + dxp * ct - dyp * st
+        wpy[j] = py + dxp * st + dyp * ct
+        vx = wvx[j]
+        vy = wvy[j]
+        wvx[j] = vx * ct - vy * st
+        wvy[j] = vx * st + vy * ct
+    for d in range(dustCount[None]):
+        dx = dustX[d] - px
+        dy = dustY[d] - py
+        dustX[d] = px + dx * ct - dy * st
+        dustY[d] = py + dx * st + dy * ct
+        vx = dustVX[d]
+        vy = dustVY[d]
+        dustVX[d] = vx * ct - vy * st
+        dustVY[d] = vx * st + vy * ct
+    for s in range(srcCount[None]):
+        dx = srcX[s] - px
+        dy = srcY[s] - py
+        srcX[s] = px + dx * ct - dy * st
+        srcY[s] = py + dx * st + dy * ct
+    dx = cavX[None] - px
+    dy = cavY[None] - py
+    cavX[None] = px + dx * ct - dy * st
+    cavY[None] = py + dx * st + dy * ct
+    for f in range(FRIC_SLOTS):
+        fricS[f] = 0.0
 
 
 # ================================================================== источники воды
@@ -858,6 +966,10 @@ def step_physics(mode, dt=None):
     compute_top_load(mode)
     count_bonds()
     refresh_field()
+    # престресс связей ОБНОВЛЯЕТСЯ каждый тик (дельтой по bpre, см. update_prestress):
+    # σ_v растёт с глубиной/K0 в рантайме -> боковое сжатие связей должно расти тоже,
+    # а не оставаться запечённым на момент сборки модели.
+    update_prestress(dt)
     # множители демпфирования на ПОДШАГ: базовые константы заданы на тик, подшагов
     # SUBSTEPS за тик, поэтому берём base^(dt/TICK) — итог за тик ровно DAMP_*_TICK.
     dfree = DAMP_FREE_TICK ** (dt / TICK)
@@ -874,10 +986,9 @@ def step_physics(mode, dt=None):
             count_bonds()
             refresh_field()
             frameBrk[None] = 0
-        # ВСЕ силы подшага — одним слитым ядром (reset+bonds+contact), затем
-        # интегрирование (с моментами качания внутри). Два лаунча вместо пяти.
-        phys_forces(dt)
-        phys_integrate(dt, dfree, dsupp, drotFree, drotBond)
+        # весь подшаг — ОДНИМ лаунчем (поле + силы + качание + интегрирование):
+        # 192 запуска ядра за тик вместо 384 (исторически — 960)
+        phys_substep(dt, dfree, dsupp, drotFree, drotBond)
     cleanup_fallen()
     if simT[None] - compactT[None] >= COMPACT_EVERY_T:
         compact_bonds()
@@ -950,6 +1061,70 @@ def center_of_mass():
     if comMass[None] > 0.0:
         comX[None] /= comMass[None]
         comY[None] /= comMass[None]
+
+
+@ti.kernel
+def hud_gather():
+    """Снимок всех значений HUD ОДНИМ ядром (слоты hudF — в physstate).
+
+    Всё, что показывает GUI-панель: время, счётчики, заполнение водой,
+    энергии, центр тяжести и параметры P. Python читает ОДИН раз
+    hudF.to_numpy() на кадр вместо двух десятков read'ов-синков."""
+    hudF[HUD_INTACT] = 0.0
+    hudF[HUD_FILL] = 0.0
+    for i in range(bondCount[None]):
+        if bondIntact[i] == 1:
+            ti.atomic_add(hudF[HUD_INTACT], 1.0)
+    for i in range(pCount[None]):
+        dx = (wx[i] / LCELL - cavX[None]) / cavRX[None]
+        dy = (wy[i] / LCELL - cavY[None]) / cavRY[None]
+        if dx * dx + dy * dy < 1.0:
+            ti.atomic_add(hudF[HUD_FILL], 1.0)
+    cap = PI * cavRX[None] * cavRY[None] * LCELL * LCELL / (PI * RP_SPH * RP_SPH)
+    if cap > 1e-9:
+        p = hudF[HUD_FILL] / cap * 100.0
+        if p > 100.0:
+            p = 100.0
+        hudF[HUD_FILL] = p
+    else:
+        hudF[HUD_FILL] = 0.0
+    hudF[HUD_SIMT] = simT[None]
+    hudF[HUD_BCOUNT] = bcount[None]
+    hudF[HUD_PCOUNT] = pCount[None]
+    hudF[HUD_BROKEN] = broken[None]
+    hudF[HUD_CRUSH] = breakCrush[None]
+    hudF[HUD_FILLFLAG] = filledFlag[None]
+    hudF[HUD_ETOT] = energyTotal[None]
+    hudF[HUD_EKIN] = energyKin[None]
+    hudF[HUD_EPOT] = energyPot[None]
+    hudF[HUD_EROT] = energyRot[None]
+    hudF[HUD_EEL] = energyEl[None]
+    hudF[HUD_COMX] = comX[None]
+    hudF[HUD_COMY] = comY[None]
+    hudF[HUD_COMASS] = comMass[None]
+    hudF[HUD_DEPTH] = P[None].depth
+    hudF[HUD_K0] = P[None].k0
+    hudF[HUD_FIXEDROWS] = P[None].fixedRows
+    hudF[HUD_BRKCAP] = P[None].brkCap
+    hudF[HUD_DMGMAX] = P[None].dmgMax
+    hudF[HUD_PLASTFLOW] = P[None].plastFlow
+    hudF[HUD_WALLS] = P[None].walls
+    hudF[HUD_G] = P[None].g
+    hudF[HUD_HEAD] = P[None].head
+    hudF[HUD_RP] = P[None].rp
+    hudF[HUD_MU] = P[None].mu
+    hudF[HUD_RCFACTOR] = P[None].rcFactor
+    hudF[HUD_MAXSIZE] = P[None].maxSize
+    hudF[HUD_E] = P[None].E
+    hudF[HUD_RHO] = P[None].rho
+    hudF[HUD_PEAKT] = stressPeak[0]
+    hudF[HUD_PEAKC] = stressPeak[1]
+
+
+def hud_snapshot():
+    """Снимок HUD для GUI: один лаунч ядра + одно копирование на кадр."""
+    hud_gather()
+    return hudF.to_numpy()
 
 
 def energy_report():

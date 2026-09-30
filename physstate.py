@@ -78,11 +78,22 @@ _bootstrap_taichi()
 
 import taichi as ti  # noqa: E402
 
-# offline_cache=False: тайчи не пишет/не лочит кеш компиляции ядер. Иначе при
-# нескольких запусках программы параллельно возникает гонка за ticache.lock
-# и предупреждение "[W] Lock ... failed". Кеш экономит только повторные запуски,
-# а решатель один — теряем немного, зато без инструктур.
-ti.init(arch=ti.vulkan, offline_cache=False)
+# offline-кеш компиляции ядер: убирает многсекундный JIT при КАЖДОМ старте
+# (без него каждый запуск перекомпилирует все ядра — CPU упирается в потолок).
+# Раньше кеш был выключен из-за гонки за ticache.lock ("[W] Lock ... failed")
+# на не-ASCII путях юзера; теперь он живёт в СОБСТВЕННОЙ ASCII-папке (через
+# короткое 8.3-имя, как пакет тайчи выше) — лок-файл пишется туда же.
+# Предупреждение при одновременном запуске двух копий программы безвредно.
+_taichi_cache = pathlib.Path(tempfile.gettempdir()) / "taichi_cache_mineudec"
+_short = _short_ascii_path(str(_taichi_cache))
+if _short is not None:
+    _taichi_cache = pathlib.Path(_short)
+_taichi_cache.mkdir(parents=True, exist_ok=True)
+# kernel_profiler — только по запросу (MINEUDEC_PROF=1): профиль по ядрам
+# для бенчмарков (распределение GPU-времени и число диспатчей).
+ti.init(arch=ti.vulkan, offline_cache=True,
+        offline_cache_file_path=str(_taichi_cache),
+        kernel_profiler=os.environ.get("MINEUDEC_PROF", "") == "1")
 
 # ------------------------------------------------------------------ константы
 COLS = 72
@@ -127,11 +138,14 @@ WSPR = 2000.0 * RHO_R * LCELL        # Н/м: жёсткость упругог�
 VMAX = 30.0 * LCELL         # м/с: предельная скорость блока (кламп)
 WVMAX = 24.0 * LCELL        # м/с: предельная скорость водяной частицы
 CONTACT_CLOSE_TOL = 0.08 * LCELL     # м: зазор смыкания трещины (передача бокового сжатия)
-DT_FLUID = 0.25 * TICK      # с: шаг флюида (3 подшага = 0.75 тика на тик)
 NFLUID_STEPS = 3            # число подшагов флюида за тик
-# ускорение флюида: за тик флюид интегрируется 0.75 тика, поэтому чтобы дать
-# ровно G_PHYS, нужно fwg*N*DT = G_PHYS*TICK:
-FWG_BASE = G_PHYS * TICK / (NFLUID_STEPS * DT_FLUID)   # м/с2
+DT_FLUID = TICK / NFLUID_STEPS   # с: шаг флюида (3 подшага = ровно 1 тик; раньше
+                            # было 0.25*TICK — флюид интегрировал 0.75 тика за тик
+                            # и вода отставала от блоков на 25% по переносу)
+# ускорение флюида: за тик флюид интегрирует ровно TICK (N*DT = TICK), поэтому
+# fwg = G_PHYS даёт ровно G_PHYS*TICK набора скорости за тик. Формула общая —
+# сама подстроится, если шаг или число подшагов изменить:
+FWG_BASE = G_PHYS * TICK / (NFLUID_STEPS * DT_FLUID)   # м/с2 (= G_PHYS)
 
 # параметры флюида (СИ; wg динамический, хранится в поле)
 H_SPH = 0.72 * LCELL        # м: радиус SPH-ядра
@@ -229,6 +243,11 @@ bfixed = ti.field(ti.i32, MAXB)
 bshade = ti.field(ti.f32, MAXB)
 bstress = ti.field(ti.f32, MAXB)
 bstressC = ti.field(ti.f32, MAXB)
+# динамическая шкала легенды напряжений: пики по сцене (нормировано на прочность),
+# индекс 0 = растяжение, 1 = сжатие. Raw — мгновенный максимум по блокам,
+# Peak — сглаженный (растёт сразу, спадает медленно): значения шкалы не дёргаются.
+stressPeakRaw = ti.field(ti.f32, 2)
+stressPeak = ti.field(ti.f32, 2)
 dbgFt = ti.field(ti.f32, ())
 dbgFnf = ti.field(ti.f32, ())
 dbgEs = ti.field(ti.f32, ())
@@ -305,6 +324,11 @@ bondDmg = ti.field(ti.f32, MAXBONDS)
 bondR = ti.field(ti.f32, MAXBONDS)
 bondJ = ti.field(ti.f32, MAXBONDS)
 brest = ti.field(ti.f32, MAXBONDS)      # длина покоя связи
+bpre = ti.field(ti.f32, MAXBONDS)       # престресс, ЗАЛОЖЕННЫЙ в brest (м): насколько длина покоя
+                                        # длиннее геометрии из-за σ_h = K0·σ_v (см. update_prestress).
+                                        # Хранится ОТДЕЛЬНО от brest, потому что в brest живёт ещё и
+                                        # пластичность (bondPlast/creep): престресс обновляется ДЕЛЬТОЙ
+                                        # (brest += bpre_new - bpre_old), пластические сдвиги не затирая.
 bondPlast = ti.field(ti.f32, MAXBONDS)  # накопленная ПЛАСТИЧЕСКАЯ вытяжка связи (клетки)
 bondSlip = ti.field(ti.f32, MAXBONDS)   # накопленное ПЛАСТИЧЕСКОЕ проскальзывание (клетки) —
                                            # сдвиговая текучесть: связь реально "ползёт" по шву,
@@ -338,6 +362,46 @@ broken = ti.field(ti.i32, shape=())
 frameBrk = ti.field(ti.i32, shape=())
 breakCrush = ti.field(ti.i32, shape=())
 dmax = ti.field(ti.f32, shape=())
+
+# снимок HUD: все значения GUI-панели за ОДНО ядро + ОДНО копирование на кадр.
+# Раньше каждый показатель читался из Python по отдельности (simT/energy/com/
+# P[None].x — два десятка read'ов скаляров), и КАЖДЫЙ read был синхронизацией
+# CPU<->GPU, сливавшей очередь ядер: GPU простаивал между мелкими копиями.
+HUD_N = 34
+hudF = ti.field(ti.f32, HUD_N)
+HUD_SIMT = 0
+HUD_BCOUNT = 1
+HUD_PCOUNT = 2
+HUD_BROKEN = 3
+HUD_CRUSH = 4
+HUD_FILLFLAG = 5
+HUD_INTACT = 6
+HUD_FILL = 7
+HUD_ETOT = 8
+HUD_EKIN = 9
+HUD_EPOT = 10
+HUD_EROT = 11
+HUD_EEL = 12
+HUD_COMX = 13
+HUD_COMY = 14
+HUD_COMASS = 15
+HUD_DEPTH = 16
+HUD_K0 = 17
+HUD_FIXEDROWS = 18
+HUD_BRKCAP = 19
+HUD_DMGMAX = 20
+HUD_PLASTFLOW = 21
+HUD_WALLS = 22
+HUD_G = 23
+HUD_HEAD = 24
+HUD_RP = 25
+HUD_MU = 26
+HUD_RCFACTOR = 27
+HUD_MAXSIZE = 28
+HUD_E = 29
+HUD_RHO = 30
+HUD_PEAKT = 31   # пик растяжения по сцене (норм. на Rt) — динамическая шкала легенды
+HUD_PEAKC = 32   # пик сжатия по сцене (норм. на Rc) — динамическая шкала легенды
 
 # ------------------------------------------------------------------ флюид
 wx = ti.field(ti.f32, MAXP)
@@ -439,22 +503,17 @@ def occ_at(x: ti.f32, y: ti.f32) -> ti.i32:
     return gOcc[row_cell(y) * COLS + clamp_cell(x)]
 
 
-@ti.kernel
-def refresh_field():
-    """Пересчитать топологию и поля напряжений.
+@ti.func
+def sigvi_field():
+    """Занятость клеток + вертикальная перегрузка (gOcc/sigVI), столбик сверху-вниз.
 
-    1) Занятость клеток блоком — по текущим позициям (без геометрии полости).
-    2) Вертикальная перегрузка в каждой занятой клетке: нагрузка от поверхности
-       + вес всего столба блоков НАД ней (сверху вниз).
-    3) Горизонтальное удержание двумя встречными проходами (сверху вниз):
-       блок держится слева/справа с давлением σ_h = K0·σ_v, ЕСЛИ сосед есть;
-       у свободной грани (выработка) с этой стороны удержания нет.
-    """
+    Выделена из refresh_field, чтобы вызывать КАЖДЫЙ подшаг из слитого ядра
+    phys_substep (solver.py): sigVI читают боковой распор (forces_reset),
+    конфайнмент трещин (forces_contact) и трение о пол/стены (forces_integrate) —
+    раньше поле обновлялось раз в TOPO_EVERY подшагов и успевало устареть."""
     for c in range(N):
         gOcc[c] = 0
         sigVI[c] = 0.0
-        holdL[c] = 0.0
-        holdR[c] = 0.0
     for i in range(bcount[None]):
         cxi = clamp_cell(bx[i])
         cyi = row_cell(by[i])
@@ -471,6 +530,24 @@ def refresh_field():
                 # блок, покрывающий клетку) даёт одинаковый вклад BMASS_UNIT*g, Н
                 carry += BMASS_UNIT * P[None].g
             y += 1
+
+
+@ti.kernel
+def refresh_field():
+    """Пересчитать топологию и поля напряжений.
+
+    1) Занятость клеток блоком — по текущим позициям (без геометрии полости).
+    2) Вертикальная перегрузка в каждой занятой клетке: нагрузка от поверхности
+       + вес всего столба блоков НАД ней (сверху вниз).
+    3) Горизонтальное удержание двумя встречными проходами (сверху вниз):
+       блок держится слева/справа с давлением σ_h = K0·σ_v, ЕСЛИ сосед есть;
+       у свободной грани (выработка) с этой стороны удержания нет.
+    Пункты 1-2 вынесены в sigvi_field() — он зовётся каждый подшаг из
+    phys_substep (свежий sigVI для распора/конфайнмента/трения)."""
+    for c in range(N):
+        holdL[c] = 0.0
+        holdR[c] = 0.0
+    sigvi_field()
     for y in range(ROWS):
         # слева-направо: удержание справа (σ_h от правого соседа)
         for x in range(COLS):
@@ -483,6 +560,76 @@ def refresh_field():
             c = y * COLS + x
             if gOcc[c] == 1 and x - 1 >= 0 and gOcc[y * COLS + x - 1] == 1:
                 holdL[c] = sigVI[c] * P[None].k0
+
+
+@ti.kernel
+def update_prestress(dt: ti.f32):
+    """Динамический престресс ГОРИЗОНТАЛЬНЫХ связей: σ_h = K0·σ_v живёт в brest.
+
+    Зовётся КАЖДЫЙ тик (step_physics) и при сборке (generate): усилие в связях
+    следует за текущим полем sigVI, а не запечённое при сборке. Раньше brest
+    выставлялся один раз в generate — при смене глубины/K0 в рантайме σ_v рос
+    (loadCur/sigVI), а боковое сжатие связей оставалось на старом значении.
+
+    Для каждой горизонтальной связи целевое сжатие F_pre = σ_h·w, где
+    σ_h = K0·σ_v (σ_v — вертикальное напряжение в точке связи по sigVI).
+    Престресс лежит в brest как смещение bpre = F_pre/k_ax (м): brest = d + bpre.
+    Обновление — ДЕЛЬТОЙ (brest += bpre_new - bpre_old, bpre = bpre_new), чтобы
+    не затирать пластичность bondPlast/creep, которая тоже накапливается в brest:
+    сдвиг brest от текучести остаётся, правится только престресс-часть. При этом
+    изменение глубины/K0/E в рантайме пересчитывает bpre и сразу меняет усилие,
+    а не «перезапускает» связь с нуля.
+
+    Вертикальные связи НЕ трогаем — их сжатие устанавливает тяжесть (bfy += bmass·g);
+    престрессовать их нельзя — будет двойной счёт с гравитацией. Жёсткость k_ax
+    берётся С КАПОМ STAB_C — та же, что в forces_bonds, иначе престресс не совпадёт
+    с усилием, которое связь реально понесёт.
+
+    Вклад σ_h в осевое усилие связи — nx² (nx — горизонтальная компонента направления
+    связи): 1 у горизонтальной, 0 у вертикальной, плавно между ними. Так наклон
+    связи при деформации/повороте плавно перераспределяет престресс, а не дёргает
+    силу скачком (жёсткий порог «горизонтальна/нет» давал импульс на F_pre при
+    каждом пересечении порога — лишние разрывы при обрушении).
+
+    Зачем: σ_h = K0·σ_v в связях — вместо силового распора от границы домена
+    (forces_reset), который не доходил до выработки и на свободной грани рисовал
+    ложное растяжение. K0 = 1 означает равные напряжения в горизонтальных и
+    вертикальных связях; распор push для связанного массива в forces_reset ОТКЛЮЧЁН
+    — иначе двойной счёт с престрессом (см. диагностику Кирша)."""
+    for bd in range(bondCount[None]):
+        if bondIntact[bd] == 0:
+            continue
+        a = bondA[bd]
+        b = bondB[bd]
+        dx = bx[b] - bx[a]
+        dy = by[b] - by[a]
+        d = ti.sqrt(dx * dx + dy * dy)
+        if d < 1e-9:
+            continue
+        nx = dx / d
+        w = bsz[a]
+        if bsz[b] < w:
+            w = bsz[b]
+        ma = bmass[a]
+        mb = bmass[b]
+        mred = ma * mb / (ma + mb + 1e-9)
+        k_ax = P[None].E * w / d
+        kstab = STAB_C * mred / (dt * dt)
+        if k_ax > kstab:
+            k_ax = kstab
+        mx = (bx[a] + bx[b]) * 0.5
+        my = (by[a] + by[b]) * 0.5
+        sv = sigVI[row_cell(my) * COLS + clamp_cell(mx)]
+        sigma_v = sv / LCELL            # Па: вес столба на клетку / ширину клетки
+        sigma_h = P[None].k0 * sigma_v  # Па
+        # вклад σ_h в осевое усилие — nx²: горизонтальна (nx²=1) несёт σ_h·w,
+        # вертикальна (nx²=0) — ничего (её сжатие даёт тяжесть), наклонная —
+        # проекцию; вклад вертикального σ_v в связь НЕ добавляем — двойной счёт
+        # с гравитацией (bfy += bmass·g) и перегрузом (ovf).
+        F_pre = sigma_h * w * nx * nx   # Н: сжатие, которое должна нести связь
+        bnew = F_pre / k_ax             # м: смещение длины покоя = престресс
+        brest[bd] += bnew - bpre[bd]    # дельта: длина покоя длиннее -> связь обжата
+        bpre[bd] = bnew
 
 
 @ti.func
@@ -538,6 +685,7 @@ def add_bond_func(a: ti.i32, b: ti.i32, rest: ti.f32, intact: ti.i32):
         bondR[i] = 0.0
         bondJ[i] = (ti.random() - 0.5) * 0.3
         brest[i] = rest * LCELL
+        bpre[i] = 0.0            # престресс назначит update_prestress (дельтой от нуля)
         bondPlast[i] = 0.0
         bondSlip[i] = 0.0
         bondFlow[i] = 0
@@ -655,6 +803,7 @@ def compact_bonds():
             bondDmg[n] = bondDmg[i]
             bondJ[n] = bondJ[i]
             brest[n] = brest[i]
+            bpre[n] = bpre[i]
             bondPlast[n] = bondPlast[i]
             bondSlip[n] = bondSlip[i]
             bondFlow[n] = bondFlow[i]
