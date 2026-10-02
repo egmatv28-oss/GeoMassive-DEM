@@ -64,6 +64,9 @@ def apply_rock(E_GPa, rp_MPa, mu, rho=None):
     # прочности на сдвиг, растяжение (σ_n>0) — отнимает. mcBond — тангенс угла
     # внутреннего трения по шву (реалистичный ~tan 35°≈0.7).
     P[None].mcBond = 0.7
+    # пуассоново раскалывание: доля сжатия σ_c, добавляемая как растяжение в
+    # связи ПЕРПЕНДИКУЛЯРНЫЕ σ_c (см. forces_bonds) — даёт трещины ВДОЛЬ сжатия
+    P[None].nuSplit = 0.25
     P[None].k0 = K0_LATERAL
     P[None].relBend = 0.15
     P[None].dmgMax = 6.0
@@ -116,7 +119,11 @@ def forces_integrate(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32,
             nF = bmass[i] * P[None].g
         if by[i] <= rx + 0.02 * LCELL or by[i] >= (ROWS * LCELL - rx - 0.02 * LCELL):
             friction_against(i, bvx[i], nF, dt, -(i + 1), kfric, 0)
-        if walls == 1:
+        # трение о БОКОВЫЕ стены — только для рухляка (nbond==0): связанный массив
+        # несёт вес связями вниз, а не висит на искусственных границах домена
+        # (иначе трение стены забирает часть веса столба и σ_v в поле занижается,
+        # а при плавном наборе перегруза режим "зависания" ещё сильнее)
+        if walls == 1 and nbond[i] == 0:
             if bx[i] <= rx + 0.02 * LCELL or bx[i] >= (COLS * LCELL - rx - 0.02 * LCELL):
                 friction_against(i, bvy[i], nF, dt, -(i + 1) - FRIC_SLOTS, kfric, 1)
         bvx[i] += bfx[i] / bmass[i] * dt
@@ -214,11 +221,13 @@ def phys_substep(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32, dro
     при 192 подшагах это сотни лишних сабмитов в секунду — они держали CPU в
     очереди драйвера, а GPU простаивал между маленькими ядрами.
 
-    Порядок внутри: sigvi_field (свежий sigVI) -> forces_zero (обнуление
+    Порядок внутри: sigvi_field (свежий sigVI) -> bond_stress_field (прокси
+    главных сжатий для раскалывания) -> forces_zero (обнуление
     аккумуляторов) -> forces_contact (контакты + флаги граней) -> forces_reset
     (базовые силы читают свежие флаги) -> forces_bonds (связи) -> forces_rock
     (моменты по свежим supp/comIn/cnck) -> forces_integrate."""
     sigvi_field()
+    bond_stress_field()
     forces_zero()
     forces_contact(dt)
     forces_reset()
@@ -285,12 +294,12 @@ def compute_top_load_fused(mode: ti.i32):
     for i in range(bcount[None]):
         ovf[i] = 0.0
     # 2. нагрузка: в режиме шахты (mode==0) давление на верхний ряд прикладывается
-    #    ВСЕГДА — сразу полным весом породы над схемой (depth), без плавного
-    #    нарастания. В остальных режимах (склон/мозаика) нагрузки сверху нет.
-    if mode == 0:
-        loadCur[None] = P[None].depth * LOAD_OVER
-    else:
-        loadCur[None] = 0.0
+    #    ВСЕГДА — весом породы над схемой (depth), ПЛАВНО с постоянной LOAD_RAMP:
+    #    мгновенное приложение полного веса даёт ударный выброс напряжений по всем
+    #    связям (ложные разрывы и волны по массиву). В остальных режимах (склон/
+    #    мозаика) нагрузки сверху нет. Изменение глубины в рантайме тоже сглажено.
+    target = P[None].depth * LOAD_OVER if mode == 0 else 0.0
+    loadCur[None] += (target - loadCur[None]) * LOAD_RAMP
     # 3. поиск верхних блоков (вложенный цикл, один kernel)
     for c in range(COLS):
         best = -1
@@ -751,6 +760,8 @@ def reset_all():
         comIn[i] = 0
         supLo[i] = 1e9
         supHi[i] = -1e9
+        bSxx[i] = 0.0
+        bSyy[i] = 0.0
     for bd in range(MAXBONDS):
         bondIntact[bd] = 0
         bondE[bd] = 0.0

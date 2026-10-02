@@ -133,6 +133,10 @@ TICK = 1.0 / 60.0           # с: время модели за один тик (
 BMASS_UNIT = RHO_R * LCELL * LCELL   # кг: масса блока размером 1 клетку (толщина 1 м)
 FT_SIGMA = 1e6              # Па: 1 МПа прочности -> Н на метр ширины контакта
 LOAD_OVER = RHO_R * G_PHYS * LCELL   # Н: вес столба породы глубиной 1 м (на столб шириной 1 клетку)
+# доля перегруза, набираемая за тик (compute_top_load_fused): нагрузка сверху
+# прикладывается ПЛАВНО (tau ≈ 0.3 с) — мгновенный полный вес даёт ударный
+# выброс напряжений по связям (ложные разрывы, волны по массиву)
+LOAD_RAMP = 1.0 - math.exp(-TICK / 0.3)
 WPRESS = RHO_W * G_PHYS * LCELL      # Н на 1 м напора: сила давления на грань блока 1 клетку
 WSPR = 2000.0 * RHO_R * LCELL        # Н/м: жёсткость упругого контакта вода-блок
 VMAX = 30.0 * LCELL         # м/с: предельная скорость блока (кламп)
@@ -225,6 +229,9 @@ class Params:
     mcBond: ti.f32   # коэффициент трения Мора-Кулона ШВА: сдвиговая прочность связи
                      # растёт с обжатием по шву (σ_n<0) и падает при растяжении (σ_n>0):
                      # Fs_cap = Fs0 + mcBond·σ_n. Честный Mohr-Coulomb на связях.
+    nuSplit: ti.f32  # коэффициент пуассонова раскалывания: доля сжатия σ_c, передаваемая
+                     # как растяжение в связи ПЕРПЕНДИКУЛЯРНЫЕ σ_c (трещины вдоль сжатия,
+                     # как в бетоне/породе, а не "блины" поперёк). ~ν породы.
 
 
 P = Params.field(shape=())
@@ -297,6 +304,9 @@ cnck = ti.field(ti.f32, MAXB)        # максимальная нормальн
                                      # (как в реальности: сильнее прижат — сильнее тормоз).
 bsz = ti.field(ti.f32, MAXB)     # размер блока (сторона квадрата), МЕТРЫ
 bmass = ti.field(ti.f32, MAXB)   # масса блока, кг = RHO_R * bsz^2 (толщина 1 м)
+bSxx = ti.field(ti.f32, MAXB)    # прокси σ_xx в точке блока: сумма сжатий связей × ux² (Н)
+bSyy = ti.field(ti.f32, MAXB)    # прокси σ_yy: сумма сжатий связей × uy² (Н) —
+                                 # направление главного сжатия для раскалывания (bond_stress_field)
 hx = ti.field(ti.f32, MAXB)      # начальная позиция (для диагностики смещения), м
 hy = ti.field(ti.f32, MAXB)
 bcount = ti.field(ti.i32, shape=())
@@ -532,6 +542,39 @@ def sigvi_field():
             y += 1
 
 
+@ti.func
+def bond_stress_field():
+    """Прокси главных СЖАТИЙ по блокам (bSxx/bSyy) из сил связей.
+
+    Для каждой целой связи её осевое сжатие раскладывается по осям (× ux²/× uy²)
+    и суммируется на концевые блоки. Направление с большим сжатием — локальное
+    главное сжатие σ_c: по нему считается пуассоново раскалывание в forces_bonds
+    (трещины ВДОЛЬ σ_c — вертикальные в поле, вдоль контура у выработки)."""
+    for i in range(bcount[None]):
+        bSxx[i] = 0.0
+        bSyy[i] = 0.0
+    for bd in range(bondCount[None]):
+        if bondIntact[bd] == 1:
+            a = bondA[bd]
+            b = bondB[bd]
+            dx = bx[b] - bx[a]
+            dy = by[b] - by[a]
+            d = ti.sqrt(dx * dx + dy * dy)
+            if d > 1e-9 and brest[bd] > 1e-9:
+                w = bsz[a]
+                if bsz[b] < w:
+                    w = bsz[b]
+                tension = P[None].E * w / brest[bd] * (d - brest[bd])
+                if tension < 0.0:
+                    c = -tension
+                    ux = dx / d
+                    uy = dy / d
+                    ti.atomic_add(bSxx[a], c * ux * ux)
+                    ti.atomic_add(bSxx[b], c * ux * ux)
+                    ti.atomic_add(bSyy[a], c * uy * uy)
+                    ti.atomic_add(bSyy[b], c * uy * uy)
+
+
 @ti.kernel
 def refresh_field():
     """Пересчитать топологию и поля напряжений.
@@ -548,6 +591,7 @@ def refresh_field():
         holdL[c] = 0.0
         holdR[c] = 0.0
     sigvi_field()
+    bond_stress_field()
     for y in range(ROWS):
         # слева-направо: удержание справа (σ_h от правого соседа)
         for x in range(COLS):
@@ -647,6 +691,8 @@ def init_block(i: ti.i32, x: ti.f32, y: ti.f32, size: ti.f32, fixed: ti.i32):
     bshade[i] = ti.random()
     bstress[i] = 0.0
     bstressC[i] = 0.0
+    bSxx[i] = 0.0
+    bSyy[i] = 0.0
     brot[i] = 0.0
     bw[i] = 0.0
     btor[i] = 0.0
@@ -773,6 +819,8 @@ def remove_block_func(rem: ti.i32):
         nbond[rem] = nbond[last]
         bsz[rem] = bsz[last]
         bmass[rem] = bmass[last]
+        bSxx[rem] = bSxx[last]
+        bSyy[rem] = bSyy[last]
         hx[rem] = hx[last]
         hy[rem] = hy[last]
         i = 0
@@ -1081,11 +1129,12 @@ def friction_vec(i: ti.i32, j: ti.i32, key: ti.i32, vt: ti.f32, Fn: ti.f32, dt: 
         riy = py - by[i]
         rjx = px - bx[j]
         rjy = py - by[j]
-        if nbond[i] == 0:
-            # τ = r × F, F_i = −Ft·t
-            ti.atomic_add(btor[i], -Ft * (rix * ty - riy * tx))
-        if nbond[j] == 0:
-            ti.atomic_add(btor[j], Ft * (rjx * ty - rjy * tx))
+        # момент трения прикладывается ВСЕГДА (как и момент нормали в
+        # apply_contact_point): трение в точке контакта -> сила в ЦТ + момент
+        # вокруг ЦТ. Пропуск момента для связанных блоков (nbond>0) замораживал
+        # поворот составных тел.
+        ti.atomic_add(btor[i], -Ft * (rix * ty - riy * tx))
+        ti.atomic_add(btor[j], Ft * (rjx * ty - rjy * tx))
 
 SUBSTEPS = 192
 DT = TICK / SUBSTEPS              # с: подшаг интегрирования DEM внутри тика

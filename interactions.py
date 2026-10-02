@@ -130,6 +130,9 @@ def forces_bonds(dt: ti.f32):
     for bd in range(bondCount[None]):
         a = bondA[bd]
         b = bondB[bd]
+        # Связь ГРАНИЦЫ модели (с закреплённым блоком — дно/опора): это не порода,
+        # крип/разрывы тут не копим, силы и моменты считаем как обычно.
+        bfixBond = bfixed[a] + bfixed[b]
         dx = bx[b] - bx[a]
         dy = by[b] - by[a]
         d = ti.sqrt(dx * dx + dy * dy)
@@ -162,7 +165,30 @@ def forces_bonds(dt: ti.f32):
         strain = d - brest[bd]
         tension = k_ax * strain          # упругое осевое усилие (до пластики)
         yieldT = Ftmax * P[None].plastYield
-        yieldC = Fcmax * P[None].plastYield
+        # Предел по СЖАТИЮ растёт с обжатием (Друкер-Прагер): σ_conf = σ3 в середине
+        # связи (sigVI обновляется каждый подшаг). Без этого yieldC константа и
+        # гидростатика ρgh течёт/рвётся как одноосное сжатие на любой глубине.
+        # При K0=1: 0.5·Rc + 0.7·σ_v > σ_v — дальнеe поле упругое, разрушение
+        # локализуется у контура выработки (там тангенциальное ~2σ).
+        mx = (bx[a] + bx[b]) * 0.5
+        my = (by[a] + by[b]) * 0.5
+        sv = sigVI[row_cell(my) * COLS + clamp_cell(mx)]
+        sigma_v = sv / LCELL
+        sigma_h = P[None].k0 * sigma_v
+        sigma_conf = sigma_h if sigma_h < sigma_v else sigma_v   # σ3, Па
+        yieldC = Fcmax * P[None].plastYield + P[None].mcBond * sigma_conf * w
+        # --- пуассоново раскалывание: сжатие σ_c растягивает связи ПЕРПЕНДИКУЛЯРНО
+        # ему (в реальном массиве это даёт неоднородность; в идеальной решётке
+        # поперечное растяжение не накапливается само). Трещины идут ВДОЛЬ сжатия —
+        # осевое раскалывание/слоение, как в бетоне и вокруг выработки, а не
+        # "блины" поперёк нагрузки. σ_c — локальное главное сжатие из
+        # bond_stress_field (направление само поворачивается у контура выработки);
+        # собственное обжатие связи гасит разрыв (net tension = tension + split).
+        cx = 0.25 * (bSxx[a] + bSxx[b])
+        cy = 0.25 * (bSyy[a] + bSyy[b])
+        split = P[None].nuSplit * ti.abs(cy) * ux * ux if ti.abs(cy) >= ti.abs(cx) \
+            else P[None].nuSplit * ti.abs(cx) * uy * uy
+        tens_eff = tension + split   # только критерий растяжения; силы не трогаем
         anyOver = 0
         # --- пластическое течение (крип) решается ДО расчёта усилий ---
         # Любой вид перегруза (растяжение, сжатие, сдвиг, изгиб) НЕ рвёт связь
@@ -177,9 +203,9 @@ def forces_bonds(dt: ti.f32):
         # Криповое повреждение bondCreep растёт по степенному закону от
         # перегруза и ЗАЛЕЧИВАЕТСЯ при разгрузке. Обрыв — только если высокую
         # нагрузку УДЕРЖИВАЛИ (накопление за время) либо превышение ЗНАЧИТЕЛЬНО.
-        if tension > yieldT:
+        if bfixBond == 0 and tens_eff > yieldT:
             anyOver = 1
-            overs = (tension - yieldT) / Ftmax    # 0..~на Ftmax
+            overs = (tens_eff - yieldT) / Ftmax    # 0..~на Ftmax
             # медленное пластическое течение (реальная вытяжка связи, саморазгрузка):
             grow = P[None].plastFlow * overs * overs * dt * brest[bd] * 0.1
             if grow > strain * 0.9:
@@ -193,7 +219,7 @@ def forces_bonds(dt: ti.f32):
             # Накопление в МЕТРАХ (× brest): порог plastLimit·brest — масштабно
             # и по размеру блока инвариантен (время до разрыва не зависит от LCELL).
             bondCreep[bd] += overs * dt * 0.5 * brest[bd]
-        elif tension < 0.0:
+        elif bfixBond == 0 and tension < 0.0:
             cstr = -tension
             if cstr > yieldC:
                 anyOver = 1
@@ -224,13 +250,32 @@ def forces_bonds(dt: ti.f32):
         # НЕ копится, потому что strain уже пересчитан по актуальному brest.
         px = -bondNY[bd]
         py = bondNX[bd]
+        ux0 = bondNX[bd]
+        uy0 = bondNY[bd]
         # упругий сдвиг поперёк НАЧАЛЬНОГО направления связи: off_eff = (off - bondSlip)
         # — пластическое проскальзывание УМЕНЬШАЕТ упругий сдвиг (как длина покоя для
         # нормали), поэтому блок фактически СЪЕЗЖАЕТ по шву, а не висит на упругой
         # деформации. Направление slip совпадает со знаком текущего off.
-        off = (dx - brest[bd] * bondNX[bd]) * px + (dy - brest[bd] * bondNY[bd]) * py
+        # ТОЧКА ШВА — середина связи (общая грань блоков), а не ЦТ блока: точки
+        # приложения сдвинуты от ЦТ каждого блока на hArm = d/2, поэтому вращение
+        # блоков даёт вклад в ПОПЕРЕЧНЫЙ сдвиг шва: off -= hArm·(θ_a+θ_b),
+        # vs -= hArm·(ω_a+ω_b). Без этого поля смещений u(y) и v(y) решётки
+        # РАЗВЯЗАНЫ: вертикальная нагрузка несётся только сдвигом горизонтальных
+        # связей, осевые силы верх/низ балки не развиваются — изгибающего
+        # напряжения нет, балка ведёт себя как «мембрана».
+        hArm = 0.5 * w * (ti.abs(ux0) + ti.abs(uy0))
+        ca = ti.cos(brot[a])
+        sa = ti.sin(brot[a])
+        cb = ti.cos(brot[b])
+        sb = ti.sin(brot[b])
+        rax = hArm * (ux0 * ca - uy0 * sa)
+        ray = hArm * (ux0 * sa + uy0 * ca)
+        rbx = -hArm * (ux0 * cb - uy0 * sb)
+        rby = -hArm * (ux0 * sb + uy0 * cb)
+        off = ((bx[b] + rbx) - (bx[a] + rax)) * px + ((by[b] + rby) - (by[a] + ray)) * py
         offEff = off - bondSlip[bd]
-        vs = rvx * px + rvy * py
+        vs = ((bvx[b] - bw[b] * rby) - (bvx[a] - bw[a] * ray)) * px \
+           + ((bvy[b] + bw[b] * rbx) - (bvy[a] + bw[a] * rax)) * py
         k_sh = k_ax / (2.0 * (1.0 + 0.25))    # G = E / 2(1+ν)
         Fs = -k_sh * offEff - 2.0 * zeta * ti.sqrt(k_sh * mred) * vs
         shearF = k_sh * offEff
@@ -240,6 +285,19 @@ def forces_bonds(dt: ti.f32):
         Ia = bmass[a] * bsz[a] * bsz[a] / 6.0
         Ib = bmass[b] * bsz[b] * bsz[b] / 6.0
         Ired = Ia * Ib / (Ia + Ib + 1e-9)
+        # демпфер поворота связи (ζ≈0.8 для пары). ОГРАНИЧЕНИЕ ПО СТАБИЛЬНОСТИ:
+        # в решётке блок участвует в nbond связях, и в шахматной моде вращения
+        # (соседние блоки крутятся в противофазе) каждый демпфер даёт на блок
+        # 2·c·ω, поэтому суммарное торможение доходит до 8·c. Без капа оно
+        # превышает предел явной схемы 2·I/dt и решётка входит в период-2 дребезг
+        # на клампе скорости (±10 рад/с). Кап: 2·crot·nbond·dt < 2·I  => crot <
+        # I/(nbond·dt), берём с запасом 0.5 (тот же стиль, что STAB_C для k).
+        crot = 1.6 * ti.sqrt(krot * Ired)
+        na_ = nbond[a] if nbond[a] > 1 else 1
+        nb_ = nbond[b] if nbond[b] > 1 else 1
+        cCap = 0.5 * ti.min(Ia / na_, Ib / nb_) / dt
+        if crot > cCap:
+            crot = cCap
         cd = 2.0 * zeta * ti.sqrt(k_ax * mred)   # Н·с/м
         Fn = -tension - cd * vn
         Fx = Fn * ux + Fs * px
@@ -250,12 +308,30 @@ def forces_bonds(dt: ti.f32):
         ti.atomic_add(bfy[b], Fy)
         ti.atomic_add(bfx[a], -Fx)
         ti.atomic_add(bfy[a], -Fy)
-        tor = -krot * rel - 1.6 * ti.sqrt(krot * Ired) * rw
+        # момент от приложения силы в ТОЧКЕ ШВА (r = ±hArm·u от ЦТ каждого блока):
+        # τ = r×F, для пары τ_a = τ_b = -hArm·(u×F). Нормальная составляющая (вдоль u)
+        # момента не даёт — только сдвиговая. Эквивалентно градиенту потенциала по
+        # углам (см. off -= hArm·(θ_a+θ_b) выше). Без него изгибающий момент шва
+        # несётся ложным рычагом силы, приложенной в ЦТ, и решётка не гнётся.
+        tlv_a = -(rax * Fy - ray * Fx)
+        tlv_b = (rbx * Fy - rby * Fx)
+        ti.atomic_add(btor[a], tlv_a)
+        ti.atomic_add(btor[b], tlv_b)
+        # Момент связи: tor - момент, приложенный к блоку A (b - противоположный).
+        # ЗНАК: восстанавливающий. Потенциал изгиба U = ½·krot·rel² (rel = brot[b]-brot[a])
+        # даёт τ_a = -∂U/∂brot[a] = +krot·rel, τ_b = -krot·rel; демпфер тянет блоки
+        # к равенству угловых скоростей: +c·(bw[b]-bw[a]) на A. Раньше стояло
+        # «tor = -krot·rel», что при применении btor[a]+=tor / btor[b]-=tor давало
+        # АНТИ-восстанавливающий момент: rel разгонялся, связи рвались по
+        # перегибу (|rel| > 3·relBend), а решётка раскручивалась в шахматном
+        # порядке (±bw до клампа). Баг был скрыт, пока контакт не давал блокам
+        # момент (brot связанных блоков оставался 0 и krot вообще не работал).
+        tor = krot * rel + crot * rw
         ti.atomic_add(btor[a], tor)
         ti.atomic_add(btor[b], -tor)
         # --- сдвиг и изгиб: тоже копят крип (не рвут мгновенно) ---
         yieldS = FsC * P[None].plastYield
-        if ti.abs(shearF) > yieldS:
+        if bfixBond == 0 and ti.abs(shearF) > yieldS:
             anyOver = 1
             so = (ti.abs(shearF) - yieldS) / FsC
             bondCreep[bd] += so * dt * 0.5 * brest[bd]
@@ -266,7 +342,7 @@ def forces_bonds(dt: ti.f32):
             if slipG > ti.abs(off) * 0.9:
                 slipG = ti.abs(off) * 0.9
             bondSlip[bd] += sgn * slipG
-        if ti.abs(rel) > P[None].relBend * P[None].plastYield:
+        if bfixBond == 0 and ti.abs(rel) > P[None].relBend * P[None].plastYield:
             anyOver = 1
             bo = (ti.abs(rel) - P[None].relBend * P[None].plastYield) / P[None].relBend
             bondCreep[bd] += bo * dt * 2.0 * brest[bd]
@@ -276,7 +352,7 @@ def forces_bonds(dt: ti.f32):
         # фронт. 0.15 = 15% от длины покоя: блок может "отойти"/"съехать" на 15%
         # (раньше было 6% — запас слишком мал и связи рвались слишком рано,
         # не дав блоку реально возобновиться).
-        if ti.abs(bondPlast[bd]) > 0.15 * brest[bd] or ti.abs(bondSlip[bd]) > 0.15 * brest[bd]:
+        if bfixBond == 0 and (ti.abs(bondPlast[bd]) > 0.15 * brest[bd] or ti.abs(bondSlip[bd]) > 0.15 * brest[bd]):
             anyOver = 1
             bondCreep[bd] = P[None].plastLimit * brest[bd]   # исчерпана пластичность -> рвём
         # залечивание: если ни один критерий не превышен — крип возвращается,
@@ -307,17 +383,17 @@ def forces_bonds(dt: ti.f32):
         # (б) иначе — только при УДЕРЖАННОМ криповом повреждении (плавное оседание).
         overE = 0
         crushE = 0
-        if tension > Ftmax * 2.5 or strain > 0.24 * LCELL:
+        if tens_eff > Ftmax * 2.5 or strain > 0.24 * LCELL:
             overE = 1
         elif -tension > Fcmax * 2.5:
             overE = 1
             crushE = 1
         elif ti.abs(shearF) > FsC * 3.0 or ti.abs(rel) > P[None].relBend * 3.0:
             overE = 1
-        if overE == 1:
+        if overE == 1 and bfixBond == 0:
             if try_fracture(bd, a, b, crushE):
                 fracture_bond(bd, a, b, crushE, strain, off, rel)
-        elif anyOver == 1 and bondCreep[bd] >= P[None].plastLimit * brest[bd]:
+        elif bfixBond == 0 and anyOver == 1 and bondCreep[bd] >= P[None].plastLimit * brest[bd]:
             crush = 0
             if tension < -1e-6:
                 crush = 1
@@ -532,11 +608,16 @@ def apply_contact_point(i: ti.i32, j: ti.i32, fkey: ti.i32,
         ti.atomic_add(bfy[j], fyy)
         ti.atomic_max(cnck[i], Fn)
         ti.atomic_max(cnck[j], Fn)
-        if nbond[i] == 0:
-            # τ_i = r_i × (−Fn·n)
-            ti.atomic_add(btor[i], Fn * (riy * nx - rix * ny))
-        if nbond[j] == 0:
-            ti.atomic_add(btor[j], Fn * (rjx * ny - rjy * nx))
+        # τ = r × F прикладывается ВСЕГДА, независимо от связей блока:
+        # сила в точке контакта -> сила в ЦТ + момент вокруг ЦТ. Пропуск момента
+        # для связанных блоков (nbond>0) замораживал поворот ЛЮБОГО составного
+        # тела: единственный внешний источник вращения - эксцентриситет контакта
+        # (гравитация идёт в ЦТ, моменты связей krot отвечают лишь на ОТНОСИТЕЛЬНЫЙ
+        # поворот блоков и при нулевых brot дают ноль). Балка-составное тело не
+        # перевешивала и не опрокидывалась, а в её связях не развивались осевые
+        # напряжения изгиба (brot оставался ровно 0 -> без натяжения верх/низ).
+        ti.atomic_add(btor[i], Fn * (riy * nx - rix * ny))
+        ti.atomic_add(btor[j], Fn * (rjx * ny - rjy * nx))
         # интервал опоры: контакт толкает блок ВВЕРХ (сила против +y)
         if ny > 0.01:
             ti.atomic_min(supLo[i], px)

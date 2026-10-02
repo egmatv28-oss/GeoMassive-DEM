@@ -380,18 +380,28 @@ def render_blocks(show: ti.i32):
             b = 134.0 + s * 22.0
             tq = bstress[i]
             cq = bstressC[i]
-            # при включённой легенде (show=1) блоки НЕ окрашиваются по шкале:
-            # цвета шкалы несут линии связей (render_bonds, scale=1)
-            if show == 0 and tq > 0.03:
-                u = tq if tq > 1.0 else tq * tq * (3.0 - 2.0 * tq)
-                r = r + (255.0 - r) * u
-                g = g + (101.0 - g) * u
-                b = b + (58.0 - b) * u
-            elif show == 0 and cq > 0.05:
-                u = cq if cq > 1.0 else cq * cq * (3.0 - 2.0 * cq)
-                r = r + (96.0 - r) * u
-                g = g + (152.0 - g) * u
-                b = b + (228.0 - b) * u
+            # СРАВНЕНИЕ В ФИЗИЧЕСКИХ ЕДИНИЦАХ: bstress нормирован на Ftmax,
+            # а bstressC — на Fcmax = rcFactor*Ftmax, поэтому сжатие,
+            # приведённое к шкале Ftmax, равно cq*rcFactor. Раньше пороги были
+            # 0.03 против 0.05 в РАЗНЫХ шкалах (сжатие требовало в 16.7 раз
+            # большего напряжения) и растяжение всегда "побеждало": блок с
+            # доминирующим сжатием подсвечивался красным, и картина изгиба
+            # выглядела перевёрнутой (сверху растяжение / снизу сжатие).
+            tphy = tq
+            cphy = cq * P[None].rcFactor
+            # �� �����񭭮� ������� (show=1) ����� �� ���訢����� �� 誠��:
+            # 梥� 誠�� ����� ����� �痢� (render_bonds, scale=1)
+            if show == 0 and (tphy > 0.03 or cphy > 0.03):
+                if tphy >= cphy:
+                    u = tq if tq > 1.0 else tq * tq * (3.0 - 2.0 * tq)
+                    r = r + (255.0 - r) * u
+                    g = g + (101.0 - g) * u
+                    b = b + (58.0 - b) * u
+                else:
+                    u = cq if cq > 1.0 else cq * cq * (3.0 - 2.0 * cq)
+                    r = r + (96.0 - r) * u
+                    g = g + (152.0 - g) * u
+                    b = b + (228.0 - b) * u
             col = ti.Vector([r / 255.0, g / 255.0, b / 255.0])
             if ti.abs(brot[i]) > 0.02:
                 fill_rot_rect(bx[i] * PX * z + ox, H - 1 - (by[i] * PX * z + oy), brot[i], ri, col)
@@ -562,18 +572,18 @@ def render_bonds(show: ti.i32, scale: ti.i32):
                 r = bondR[bd]
                 a = bondA[bd]
                 b = bondB[bd]
-                if r > 0.12:
-                    # растяжение: r = F/Ftmax — та же нормировка, что bstress
-                    col = ORANGE
-                    if scale == 1:
-                        col = legend_band_color(0, stress_band(r, stressPeak[0]))
-                    draw_line(bx[a] * PX * z + ox, H - 1 - (by[a] * PX * z + oy),
-                              bx[b] * PX * z + ox, H - 1 - (by[b] * PX * z + oy), col, 2.0)
-                elif r < -0.12:
-                    # сжатие: r = F/(Fcmax*0.25), значит -F/Fcmax = -r*0.25 — как bstressC
-                    col = BLUE
-                    if scale == 1:
-                        col = legend_band_color(1, stress_band(-r * 0.25, stressPeak[1]))
+                tphy = r
+                cphy = -r * 0.25 * P[None].rcFactor if r < 0.0 else 0.0
+                col = ORANGE
+                if tphy > 0.12 or cphy > 0.12:
+                    if tphy >= cphy:
+                        col = ORANGE
+                        if scale == 1:
+                            col = legend_band_color(0, stress_band(r, stressPeak[0]))
+                    else:
+                        col = BLUE
+                        if scale == 1:
+                            col = legend_band_color(1, stress_band(-r * 0.25, stressPeak[1]))
                     draw_line(bx[a] * PX * z + ox, H - 1 - (by[a] * PX * z + oy),
                               bx[b] * PX * z + ox, H - 1 - (by[b] * PX * z + oy), col, 2.0)
 
@@ -1122,11 +1132,10 @@ def generate(mode, weak, tilt_deg=0.0):
         else:
             gen_slope(weak)
     # Престресс горизонтальных связей: σ_h = K0·σ_v заложен в связи сразу после сборки
-    # (см. update_prestress). Перегруз loadCur ставим как в compute_top_load_fused,
-    # чтобы σ_v включал вес вышележащих пород (иначе престресс был бы без перегруза).
-    # Дальше update_prestress зовётся КАЖДЫЙ тик в step_physics — усилие связей
-    # динамически следует за глубиной/K0, меняющимися в рантайме.
-    loadCur[None] = (P[None].depth * LOAD_OVER) if mode == 0 else 0.0
+    # (см. update_prestress). Перегруз loadCur набирается ПЛАВНО в compute_top_load_fused
+    # (LOAD_RAMP) — мгновенный полный вес даёт ударный выброс по связям; update_prestress
+    # зовётся КАЖДЫЙ тик в step_physics и динамически следует за глубиной/K0 и рампой.
+    loadCur[None] = 0.0
     refresh_field()
     update_prestress(DT)
 
