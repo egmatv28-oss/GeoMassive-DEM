@@ -171,6 +171,8 @@ def fill_rect(x0: ti.i32, y0: ti.i32, x1: ti.i32, y1: ti.i32, col: ti.template()
 @ti.func
 def fill_rot_rect(cx: ti.f32, cy: ti.f32, ang: ti.f32, half: ti.f32, col: ti.template()):
     # заливка квадрата со стороной 2*half, повёрнутого на ang вокруг (cx, cy)
+    # ang в соглашении физики: brot>0 = по часовой на экране (мир y вниз),
+    # буфер же Y вверх, поэтому тест R(+ang)·d даёт фигуру R(-ang) — по часовой
     c = ti.cos(ang)
     s = ti.sin(ang)
     # половинки повёрнутого квадрата в проекциях на оси
@@ -182,8 +184,8 @@ def fill_rot_rect(cx: ti.f32, cy: ti.f32, ang: ti.f32, half: ti.f32, col: ti.tem
         while Y <= ti.min(H - 1, int(cy + hy)):
             dx = X - cx
             dy = Y - cy
-            ux = c * dx + s * dy
-            uy = -s * dx + c * dy
+            ux = c * dx - s * dy
+            uy = s * dx + c * dy
             if ti.abs(ux) <= half and ti.abs(uy) <= half:
                 img[X, Y] = col
             Y += 1
@@ -609,7 +611,12 @@ def render_joints():
         ux = dx / d
         uy = dy / d
         w = ti.min(bsz[a], bsz[b]) * 0.5
-        px = -uy * w * PX * z
+        # нормаль связи В БУФЕРЕ (мир y вниз, буфер Y = H-1-y вверх):
+        # связь в буфере (ux, -uy), её перпендикуляр (uy, ux). Раньше перпендикуляр
+        # брался в мировых осях (-uy, ux) и рисовался без переворота Y — засечка
+        # зеркалилась и на повёрнутой модели стояла поперёк связи с ошибкой 2*theta
+        # (ровно как квадраты блоков до фикса fill_rot_rect).
+        px = uy * w * PX * z
         py = ux * w * PX * z
         cx0 = mx * PX * z + ox
         cy0 = H - 1 - (my * PX * z + oy)
@@ -632,16 +639,27 @@ def render_cracks():
         b = bondB[bd]
         dx = bx[b] - bx[a]
         dy = by[b] - by[a]
-        if dx * dx + dy * dy > 1.7 * LCELL * LCELL:
+        dd = dx * dx + dy * dy
+        if dd > 1.7 * LCELL * LCELL:
             continue
+        d = ti.sqrt(dd)
         mx = (bx[a] + bx[b]) * 0.5 * PX * z + ox
         my = H - 1 - ((by[a] + by[b]) * 0.5 * PX * z + oy)
         j = bondJ[bd] * PX * z
         hl = ti.min(bsz[a], bsz[b]) * PX * z * 0.55
-        if ti.abs(dx) >= ti.abs(dy):
-            draw_line(mx + j * 0.4, my - hl, mx - j * 0.4, my + hl, CRACK, 2.0)
-        else:
-            draw_line(mx - hl, my + j * 0.4, mx + hl, my - j * 0.4, CRACK, 2.0)
+        # засечка трещины ПОПЕРЁК связи, полюс скольжения j ВДОЛЬ связи;
+        # оси буфера (мир y вниз -> Y вверх): вдоль связи (ux, -uy), поперёк (uy, ux).
+        # Раньше засечка была жёстко вертикаль/горизонталь по мировым осям
+        # (ветвление |dx|>=|dy|) — на повёрнутой модели трещины не лежали поперёк
+        # шва, а «провернуты» так же, как засечки связей.
+        ux = dx / d
+        uy = dy / d
+        tx = ux
+        ty = -uy
+        nx = uy
+        ny = ux
+        draw_line(mx + 0.4 * j * tx - hl * nx, my + 0.4 * j * ty - hl * ny,
+                  mx - 0.4 * j * tx + hl * nx, my - 0.4 * j * ty + hl * ny, CRACK, 2.0)
 
 
 @ti.kernel
