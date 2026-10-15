@@ -45,7 +45,11 @@ def apply_rock(E_GPa, rp_MPa, mu, rho=None):
         P[None].rho = RHO_R
     # ζ — относительное демпфирование (доля критического) пары блоков:
     # оно же используется и для связей, и для контактов (см. phys_bonds/phys_contact).
-    P[None].cn = 0.28    # ζ связи: гасит колебания при жёсткой связи (в критич. единицах)
+    P[None].cn = 0.5     # ζ связи: гасит колебания при жёсткой связи (в критич. единицах).
+                         # 0.28 оставляло заметные "скачки" напряжений по массиву
+                         # (упругие волны в связной решётке звонят); 0.5 - около
+                         # половины критического демпфирования, звон гасится за
+                         # несколько периодов, квазистатика не меняется.
     P[None].cnc = 0.6    # ζ КОНТАКТА блоков: заметно гасит подпрыгивание обломков.
                          # Больше брать НЕЛЬЗЯ: эмпирически ζ≈0.8 и выше дают взрывной
                          # каскад при росте нагрузки, а полное критическое 2·√(k/m)
@@ -110,13 +114,33 @@ def forces_integrate(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32,
         # и свободные обломки беспрепятственно раскатываются по поверхности.
         # Нормаль = собственный вес + вес столба над ним (sigVI — Н на клетку).
         kfric = P[None].E
-        # предел устойчивости явной схемы для пружины трения о жёсткую границу (см. STAB_C)
+        # явная схема: кап трения чтобы не "прилипало" (см. STAB_C)
         kstabF = STAB_C * bmass[i] / (dt * dt)
         if kfric > kstabF:
             kfric = kstabF
+        # Нормальная сила трения о границы. Для СВЯЗАННОГО массива - геостатика
+        # (sigVI). Для рыхлого обломка (nbond==0) - только его ФАКТИЧЕСКАЯ
+        # нагрузка: вес + контактное давление сверху (cnck). Поле sigVI
+        # пропускает нагрузку через пустоты (carry в sigvi_field не сбрасывается
+        # на дырках), поэтому одинокий обломок в воздухе получал sigVI = вес всей
+        # вышележащей породы (loadCur): mu*nF ~ 4.6e5 Н против веса 6.1e3 Н -
+        # трение намертво "приклеивало" обломки к стенкам/полу, и они висели в
+        # воздухе (в т.ч. целыми кластерами на таком якоре).
         nF = bmass[i] * P[None].g + sigVI[row_cell(by[i]) * COLS + clamp_cell(bx[i])]
+        if nbond[i] == 0:
+            nF = bmass[i] * P[None].g + cnck[i]
         if nF < bmass[i] * P[None].g:
             nF = bmass[i] * P[None].g
+        # Нормаль трения о СТЕНКУ - боковой распор (как th в forces_reset), а не
+        # вертикальная нагрузка: иначе обломок, зажатый в куче у стены,
+        # "прилипал" к ней (mu*(m*g+cnck) держал вес всей кучи).
+        nFw = K0_RUBBLE * sigVI[row_cell(by[i]) * COLS + clamp_cell(bx[i])] * (bsz[i] / LCELL) \
+            + P[None].g * LATERAL_FLOOR * bmass[i]
+        if nbond[i] == 0:
+            # рыхлый обломок у стены держит только собственный боковой вес:
+            # иначе блок в куче у боковой границы "прилипал" к ней (эффект Янссена
+            # для связной породы оставлен - там это физика)
+            nFw = P[None].g * LATERAL_FLOOR * bmass[i]
         if by[i] <= rx + 0.02 * LCELL or by[i] >= (ROWS * LCELL - rx - 0.02 * LCELL):
             friction_against(i, bvx[i], nF, dt, -(i + 1), kfric, 0)
         # трение о БОКОВЫЕ стены — только для рухляка (nbond==0): связанный массив
@@ -125,7 +149,7 @@ def forces_integrate(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32,
         # а при плавном наборе перегруза режим "зависания" ещё сильнее)
         if walls == 1 and nbond[i] == 0:
             if bx[i] <= rx + 0.02 * LCELL or bx[i] >= (COLS * LCELL - rx - 0.02 * LCELL):
-                friction_against(i, bvy[i], nF, dt, -(i + 1) - FRIC_SLOTS, kfric, 1)
+                friction_against(i, bvy[i], nFw, dt, -(i + 1) - FRIC_SLOTS, kfric, 1)
         bvx[i] += bfx[i] / bmass[i] * dt
         bvy[i] += bfy[i] / bmass[i] * dt
         # Связанные и опирающиеся блоки гасятся сильно (устойчивость массива,
@@ -135,8 +159,8 @@ def forces_integrate(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32,
         # возвращается.
         # dfree/dsupp/drot* — множители демпфирования ЗА ПОДШАГ: базовые константы
         # (DAMP_*_TICK) задуманы на тик, но здесь применяются SUBSTEPS раз за тик,
-        # поэтому шагом раньше пересчитаны как base^(dt/TICK). Иначе 192-кратное
-        # применение давало бы v *= 0.9995^192 ≈ 0.908 за тик и искусственную
+        # поэтому шагом раньше пересчитаны как base^(dt/TICK). Иначе 384-кратное
+        # применение давало бы v *= 0.9995^384 ≈ 0.825 за тик и искусственную
         # терминальную скорость падения ~3.4 клетки/с вместо реального свободного
         # падения (обломки "ползли" вниз много секунд).
         if nbond[i] == 0 and supp[i] == 0:
@@ -218,7 +242,7 @@ def phys_integrate(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32, d
 def phys_substep(dt: ti.f32, dfree: ti.f32, dsupp: ti.f32, drotFree: ti.f32, drotBond: ti.f32):
     """Весь подшаг ЦЕЛИКОМ ОДНИМ лаунчем: поле напряжений -> силы -> качание ->
     интегрирование. Один запуск ядра на подшаг вместо двух (исторически пяти):
-    при 192 подшагах это сотни лишних сабмитов в секунду — они держали CPU в
+    при 384 подшагах это сотни лишних сабмитов в секунду — они держали CPU в
     очереди драйвера, а GPU простаивал между маленькими ядрами.
 
     Порядок внутри: sigvi_field (свежий sigVI) -> bond_stress_field (прокси
@@ -242,13 +266,26 @@ def count_bonds():
         nbond[i] = 0
         hasL[i] = 0
         hasR[i] = 0
-    for i in range(bcount[None]):
-        for w in range(BMAPW):
-            bondMap[i, w] = 0
+    # Плоский параллельный цикл вместо вложенного: вложенный for на GPU
+    # сериализуется по потокам и давал ~30 мс/тик на одной только очистке
+    # (bcount*BMAPW итераций по 2 поля). Чистим только достижимые слова:
+    # биты ставятся индексами блоков < bcount, значит слово j>>5 < nw.
+    nw = (bcount[None] + 31) >> 5
+    for idx in range(bcount[None] * nw):
+        bondMap[idx // nw, idx % nw] = 0
+        hasMap[idx // nw, idx % nw] = 0
     for bd in range(bondCount[None]):
-        if bondIntact[bd] == 1:
-            a = bondA[bd]
-            b = bondB[bd]
+        st = bondIntact[bd]
+        if st == BOND_DEAD:
+            continue
+        a = bondA[bd]
+        b = bondB[bd]
+        # hasMap: у пары есть запись связи (целая ИЛИ шов) — для флагов трещин
+        # crackL/crackR: трещиной считается только пара БЕЗ записи, иначе распор
+        # рыхляка в forces_reset сложится с усилием сжимаемого шва (двойной счёт)
+        ti.atomic_or(hasMap[a, b >> 5], 1 << (b & 31))
+        ti.atomic_or(hasMap[b, a >> 5], 1 << (a & 31))
+        if st == BOND_INTACT:
             ti.atomic_add(nbond[a], 1)
             ti.atomic_add(nbond[b], 1)
             ti.atomic_or(bondMap[a, b >> 5], 1 << (b & 31))
@@ -288,6 +325,25 @@ def cleanup_fallen():
 
 
 # ------------------------------------------------------------------ верхняя нагрузка
+@ti.func
+def find_top_blocks():
+    """Верхний блок каждой колонки за O(bcount) атомарным min вместо
+    O(COLS*bcount) вложенного скана (вложенный for на GPU сериализуется).
+    topCol/topYArr заполняются в compute_top_load_fused и переиспользуются
+    в refill_top_overburden того же тика. При равных y выбирается любой из
+    равных (раньше - первый по индексу; на физику не влияет)."""
+    for c in range(COLS):
+        topCol[c] = -1
+        topYArr[c] = 1e9
+    for i in range(bcount[None]):
+        c = clamp_cell(bx[i])
+        ti.atomic_min(topYArr[c], by[i])
+    for i in range(bcount[None]):
+        c = clamp_cell(bx[i])
+        if by[i] <= topYArr[c]:
+            topCol[c] = i
+
+
 @ti.kernel
 def compute_top_load_fused(mode: ti.i32):
     # 1. обнуление ovf
@@ -300,17 +356,8 @@ def compute_top_load_fused(mode: ti.i32):
     #    мозаика) нагрузки сверху нет. Изменение глубины в рантайме тоже сглажено.
     target = P[None].depth * LOAD_OVER if mode == 0 else 0.0
     loadCur[None] += (target - loadCur[None]) * LOAD_RAMP
-    # 3. поиск верхних блоков (вложенный цикл, один kernel)
-    for c in range(COLS):
-        best = -1
-        bestY = 1e9
-        for i in range(bcount[None]):
-            cc = clamp_cell(bx[i])
-            if cc == c and by[i] < bestY:
-                bestY = by[i]
-                best = i
-        topCol[c] = best
-        topYArr[c] = bestY
+    # 3. поиск верхних блоков O(bcount) атомарным min (см. find_top_blocks)
+    find_top_blocks()
     # 4. приложение нагрузки: полный вес давит на верхний блок каждой колонки.
     #    loadCur — уже Н (вес породы над колонкой шириной 1 клетку).
     f = loadCur[None]
@@ -333,26 +380,20 @@ def refill_top_overburden(mode: ti.i32):
     on = 0
     if mode == 0 and refillOff[None] == 0:
         on = 1
-    # 1. находим верхний блок каждой колонки — ПАРАЛЛЕЛЬНО по колонкам.
+    # 1. находим колонки с пустой верхней клеткой — ПАРАЛЛЕЛЬНО по колонкам.
     #    (раньше весь проход был сплошным while на ОДНОМ потоке GPU:
     #    O(COLS*blocks) серийно = ~32 мс/тик в одиночном ядре — главная
     #    статья времени GPU при «простаивающем» виде. ВАЖНО: for должен быть
     #    на ВЕРХНЕМ уровне ядра — цикл внутри if тайчи демотирует в serial.
     #    Спавн и связывание ниже остаются серийными: add_block_func не атомарен
     #    по bcount, но там всего O(COLS) работы.)
+    #    Скан верха колонок переиспользуется из compute_top_load_fused
+    #    (topCol/topYArr того же тика) — он уже посчитан за O(bcount).
     for col in range(COLS):
         newRubble[col] = -1
         if on == 1:
-            best = -1
-            bestY = 1e9
-            nb = bcount[None]
-            i = 0
-            while i < nb:
-                cc = clamp_cell(bx[i])
-                if cc == col and by[i] < bestY:
-                    bestY = by[i]
-                    best = i
-                i += 1
+            best = topCol[col]
+            bestY = topYArr[col]
             # верхняя клетка (y=0) свободна, если в колонке вообще нет блока,
             # либо самый верхний блок опустился ниже неё (координаты в м);
             # -2 = «нужен спавн», реальный индекс заполнит серийный проход ниже
@@ -386,6 +427,18 @@ def compute_top_load(mode):
 
 
 # ================================================================== флюид
+@ti.kernel
+def water_forces_zero():
+    """Сброс гидравлических сил на блоки (wfx/wfy). Вызывается КАЖДЫЙ тик,
+    даже когда воды нет: раньше обнуление жило внутри collide_water, который
+    работает только при pCount>0 - после слива/впитывания воды последние силы
+    давления ЗАСТРЕВАЛИ на блоке навсегда (фантомное давление воды держало
+    блок в воздухе: ax/ay != g при cnck=0, nbond=0 - см. [freeze])."""
+    for i in range(bcount[None]):
+        wfx[i] = 0.0
+        wfy[i] = 0.0
+
+
 @ti.kernel
 def fluid_integrate(dt: ti.f32):
     for i in range(pCount[None]):
@@ -763,16 +816,19 @@ def reset_all():
         bSxx[i] = 0.0
         bSyy[i] = 0.0
     for bd in range(MAXBONDS):
-        bondIntact[bd] = 0
+        bondIntact[bd] = BOND_DEAD
         bondE[bd] = 0.0
         bpre[bd] = 0.0
         bondPlast[bd] = 0.0
         bondSlip[bd] = 0.0
         bondFlow[bd] = 0
         bondCreep[bd] = 0.0
-    for i in range(MAXB):
-        for w in range(BMAPW):
-            bondMap[i, w] = 0
+        bondOver[bd] = 0.0
+        bondSplitAvg[bd] = 0.0
+    # плоский параллельный цикл (вложенный for сериализуется на GPU)
+    for idx in range(MAXB * BMAPW):
+        bondMap[idx // BMAPW, idx % BMAPW] = 0
+        hasMap[idx // BMAPW, idx % BMAPW] = 0
 
 
 @ti.kernel
@@ -791,8 +847,12 @@ def _load_blocks(blocks: ti.types.ndarray()):
 @ti.kernel
 def _load_bonds(bonds: ti.types.ndarray()):
     for k in range(bonds.shape[0]):
-        add_bond_func(ti.cast(bonds[k, 0], ti.i32), ti.cast(bonds[k, 1], ti.i32), bonds[k, 2],
-                      ti.cast(bonds[k, 3], ti.i32))
+        # целостность из внешней модели: 1 -> целая связь, 0 -> шов (BOND_JOINT:
+        # сохраняет сжатие, как разорванная связь); BOND_DEAD загрузке недоступен
+        st = BOND_JOINT
+        if ti.cast(bonds[k, 3], ti.i32) == 1:
+            st = BOND_INTACT
+        add_bond_func(ti.cast(bonds[k, 0], ti.i32), ti.cast(bonds[k, 1], ti.i32), bonds[k, 2], st)
 
 
 @ti.kernel
@@ -947,14 +1007,19 @@ def fluid_step(dt):
     fluid_vel(dt)
 
 
+_tickN = 0    # номер тика в процессе (для разреженных задач: cleanup/энергия)
+
+
 def step_physics(mode, dt=None):
     """Продвинуть локальную физику на ОДИН ТИК внутреннего времени (TICK с).
 
     dt — подшаг интегрирования внутри тика (по умолчанию DT = TICK/SUBSTEPS).
     Тик не зависит от кадров/реального времени: следующий тик стартует только
     после полного расчёта этого и идёт так быстро, как позволяет CPU."""
+    global _tickN
     if dt is None:
         dt = DT
+    _tickN += 1
     simT[None] += TICK
     frameBrk[None] = 0
     decay_bond_damage()
@@ -963,6 +1028,9 @@ def step_physics(mode, dt=None):
     if capWarned[None] == 1 and pc < PMAX * 0.85:
         capWarned[None] = 0
     build_hash()
+    # гидравлические силы обнуляются ВСЕГДА (см. water_forces_zero): иначе при
+    # нуле частиц воды последние wfx/wfy застревали на блоках навечно
+    water_forces_zero()
     # когда воды нет, флюидные подшаги пропускаются ЦЕЛИКОМ: ~25 пустых лаунчей
     # ядер за тик — заметная доля CPU-накладных расходов (GPU при этом простаивает)
     if pc > 0:
@@ -980,7 +1048,7 @@ def step_physics(mode, dt=None):
     # престресс связей ОБНОВЛЯЕТСЯ каждый тик (дельтой по bpre, см. update_prestress):
     # σ_v растёт с глубиной/K0 в рантайме -> боковое сжатие связей должно расти тоже,
     # а не оставаться запечённым на момент сборки модели.
-    update_prestress(dt)
+    update_prestress(dt, PRESTRESS_RAMP)
     # множители демпфирования на ПОДШАГ: базовые константы заданы на тик, подшагов
     # SUBSTEPS за тик, поэтому берём base^(dt/TICK) — итог за тик ровно DAMP_*_TICK.
     dfree = DAMP_FREE_TICK ** (dt / TICK)
@@ -998,18 +1066,23 @@ def step_physics(mode, dt=None):
             refresh_field()
             frameBrk[None] = 0
         # весь подшаг — ОДНИМ лаунчем (поле + силы + качание + интегрирование):
-        # 192 запуска ядра за тик вместо 384 (исторически — 960)
+        # 384 запуска ядра за тик (по одному на подшаг)
         phys_substep(dt, dfree, dsupp, drotFree, drotBond)
-    cleanup_fallen()
+    # cleanup_fallen — СЕРИЙНЫЙ while по всем блокам (снятие с хвоста), на GPU
+    # один поток на ~2 мс; вылетевшие обломки вне экрана и 4 тика не мешают
+    if _tickN % 4 == 0:
+        cleanup_fallen()
     if simT[None] - compactT[None] >= COMPACT_EVERY_T:
         compact_bonds()
         compactT[None] = simT[None]
-    # --- равномерная сводка по всем блокам после каждого тика ---
+    # --- равномерная сводка по всем блокам (каждый 2-й тик) ---
     # Полная энергия каждого блока и интегралы системы + центр тяжести.
-    # Считаются для ВСЕХ блоков одинаково, каждый тик — контроль закона
-    # сохранения энергии и положения центра тяжести.
-    compute_energy()
-    center_of_mass()
+    # Считаются для ВСЕХ блоков одинаково — контроль закона сохранения энергии
+    # и положения центра тяжести. Разрежено: 4 атомарные редукции по всем
+    # блокам/связям на слабом GPU дороже самих подшагов, а сводка - диагностика.
+    if _tickN % 2 == 0:
+        compute_energy()
+        center_of_mass()
 
 # ================================================================== энергия и центр тяжести
 @ti.kernel
@@ -1144,5 +1217,63 @@ def energy_report():
 
 
 def center_of_mass_report():
-    """Центр тяжести (масс) после последнего тика: (x, y, масса), м/кг."""
+    """Центр тяжести системы после последнего тика: (x, y, mass), м/кг."""
     return (comX[None], comY[None], comMass[None])
+
+
+def frozen_report():
+    """Диагностика зависших блоков: не закреплён, почти неподвижен, опоры снизу
+    нет. Печатает, какая сила ДЕРЖИТ блок (связь/контакт/трение/фантом).
+    Вызывается из GUI примерно раз в 3 с - смотреть КОНСОЛЬ."""
+    n = bcount[None]
+    if n == 0:
+        return 0
+    x = bx.to_numpy()[:n]
+    y = by.to_numpy()[:n]
+    vxb = bvx.to_numpy()[:n]
+    vyb = bvy.to_numpy()[:n]
+    nb = nbond.to_numpy()[:n]
+    fix = bfixed.to_numpy()[:n]
+    com = comIn.to_numpy()[:n]
+    sup = supp.to_numpy()[:n]
+    inc = inContact.to_numpy()[:n]
+    cn = cnck.to_numpy()[:n]
+    fxb = bfx.to_numpy()[:n]
+    fyb = bfy.to_numpy()[:n]
+    wfxv = wfx.to_numpy()[:n]
+    wfyv = wfy.to_numpy()[:n]
+    ovfv = ovf.to_numpy()[:n]
+    m = bmass.to_numpy()[:n]
+    out = []
+    for i in range(n):
+        if fix[i] == 1:
+            continue
+        if vxb[i] * vxb[i] + vyb[i] * vyb[i] > 2.5e-5:
+            continue
+        if y[i] >= ROWS * LCELL - 0.3:
+            continue
+        ok = False
+        for j in range(n):
+            if j == i or abs(x[j] - x[i]) > 0.6:
+                continue
+            dy = y[j] - y[i]
+            if 0.0 < dy < 0.8:
+                ok = True
+                break
+        if ok:
+            continue
+        out.append(i)
+    if out:
+        print("[freeze] %d block(s) frozen WITHOUT support below:" % len(out))
+        for i in out[:8]:
+            zone = ""
+            if x[i] < 0.5:
+                zone = " LEFT-WALL"
+            if x[i] > COLS * LCELL - 0.5:
+                zone = " RIGHT-WALL"
+            print("   #%d pos=(%.2f,%.2f) nbond=%d comIn=%d supp=%d inC=%d "
+                  "cnck=%.0fN mg=%.0fN ax=%+.2f ay=%+.2f wfx=%.0f wfy=%.0f ovf=%.0f%s"
+                  % (i, x[i], y[i], nb[i], com[i], sup[i], inc[i],
+                     cn[i], m[i] * 9.81, fxb[i] / m[i], fyb[i] / m[i],
+                     wfxv[i], wfyv[i], ovfv[i], zone))
+    return len(out)

@@ -91,19 +91,92 @@ if _short is not None:
 _taichi_cache.mkdir(parents=True, exist_ok=True)
 # kernel_profiler — только по запросу (MINEUDEC_PROF=1): профиль по ядрам
 # для бенчмарков (распределение GPU-времени и число диспатчей).
-ti.init(arch=ti.vulkan, offline_cache=True,
+def _probe_backend(arch_name, timeout=15):
+    """Проба бэкенда (ti.init + тривиальное ядро) в ОТДЕЛЬНОМ процессе.
+
+    Сломанный GPU-драйвер (TDR, "Vulkan device might be lost") роняет процесс
+    C-assert'ом или вешает его намертво - Python-исключение не возникает,
+    поэтому проба идёт в подпроцессе: смерть/зависание/таймаут = бэкенд плох.
+    Возвращает секунды на 30 мелких лаунчей ядра (прокси накладных расходов
+    диспетчера - именно они решают при ~8 тыс. запусках ядер за тик) или None.
+    Скрипт пишется файлом, а не -c: Taichi требует исходник ядра через inspect."""
+    import subprocess
+    src = (
+        "import taichi as ti, sys, time\n"
+        "ti.init(arch=getattr(ti, sys.argv[1]), offline_cache=False)\n"
+        "x = ti.field(ti.i32, shape=1024)\n"
+        "@ti.kernel\n"
+        "def _pk():\n"
+        "    for i in x:\n"
+        "        x[i] = i * i\n"
+        "_pk()\n"
+        "t0 = time.perf_counter()\n"
+        "for _ in range(30):\n"
+        "    _pk()\n"
+        "ti.sync()\n"
+        "print('PROBE_OK %.6f' % (time.perf_counter() - t0))\n"
+    )
+    f = pathlib.Path(tempfile.gettempdir()) / "mineudec_probe.py"
+    try:
+        f.write_text(src)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+        r = subprocess.run([sys.executable, str(f), arch_name],
+                           capture_output=True, timeout=timeout, env=env)
+        if r.returncode == 0 and b"PROBE_OK" in r.stdout:
+            return float(r.stdout.split()[-1])
+    except Exception:
+        pass
+    return None
+
+
+def _select_arch():
+    """Бэкенд расчёта: MINEUDEC_ARCH=vulkan|opengl|cpu|cuda - принудительно;
+    auto (по умолчанию) - vulkan с пробой, иначе БЫСТРЕЙШИЙ из cpu/opengl.
+    Сломанный Vulkan не должен ронять всю программу: она просто уходит на
+    другое устройство (пока драйвер не перезагружен). Провал vulkan кэшируется
+    на 30 минут, чтобы не ждать таймаут пробы при каждом запуске."""
+    want = os.environ.get("MINEUDEC_ARCH", "auto").strip().lower()
+    if want in ("vulkan", "opengl", "cpu", "cuda", "dx12"):
+        return getattr(ti, want), want
+    vbad = pathlib.Path(tempfile.gettempdir()) / "mineudec_vulkan_bad.cache"
+    skip_vulkan = False
+    try:
+        if vbad.exists() and time.time() - float(vbad.read_text()) < 1800.0:
+            skip_vulkan = True
+    except Exception:
+        pass
+    if not skip_vulkan:
+        tv = _probe_backend("vulkan")
+        if tv is not None:
+            return ti.vulkan, "vulkan"
+        try:
+            vbad.write_text(str(time.time()))
+        except Exception:
+            pass
+    # запасной вариант: на мелких лаунчах драйвер GL может быть медленнее CPU
+    tc = _probe_backend("cpu")
+    to = _probe_backend("opengl")
+    if to is not None and (tc is None or to < tc):
+        return ti.opengl, "opengl"
+    return ti.cpu, "cpu"
+
+
+_ARCH, _ARCH_NAME = _select_arch()
+print("[mineudec] compute backend: %s" % _ARCH_NAME)
+ti.init(arch=_ARCH, offline_cache=True,
         offline_cache_file_path=str(_taichi_cache),
         kernel_profiler=os.environ.get("MINEUDEC_PROF", "") == "1")
 
 # ------------------------------------------------------------------ константы
-COLS = 72
-ROWS = 44
+COLS = 64         # область 64x64 блока (запрошенный размер)
+ROWS = 64
 CELL = 16
 W = COLS * CELL
 H = ROWS * CELL
 N = COLS * ROWS
-MAXB = 4096
-MAXBONDS = 8192
+MAXB = 8192       # >= N = 64*64 = 4096
+MAXBONDS = 24576  # ~2N связей на полной решётке + запас на швы (не удаляются)
 MAXP = 5200
 PMAX = 5000
 MAXDUST = 240
@@ -128,7 +201,13 @@ LCELL = 0.5                 # м на клетку (параметр дискр�
 RHO_R = 2500.0              # плотность породы, кг/м3
 RHO_W = 1000.0              # плотность воды, кг/м3
 G_PHYS = 9.81               # ускорение свободного падения, м/с2
-TICK = 1.0 / 60.0           # с: время модели за один тик (единица расчёта времени)
+TICK = 1.0 / float(os.environ.get("MINEUDEC_TICK_HZ", "120"))  # с: время модели за один тик
+# Тик - «модельные часы» GUI (1 тик = 1 кадр). На ТОЧНОСТЬ физики размер тика
+# не влияет - её задаёт подшаг dt (см. SUBSTEPS ниже). Меньший тик (например
+# MINEUDEC_TICK_HZ=500 -> 1/500 с) даёт более плавный набор нагрузки/престресса
+# (после тика, а не 5.4% скачком), но и в 8 раз больше служебных пересборок на
+# секунду модели при той же скорости отрисовки. SUBSTEPS подбирается так, чтобы
+# dt остался прежним - схема не меняет устойчивость.
 # производные величины (СИ, из базовых констант):
 BMASS_UNIT = RHO_R * LCELL * LCELL   # кг: масса блока размером 1 клетку (толщина 1 м)
 FT_SIGMA = 1e6              # Па: 1 МПа прочности -> Н на метр ширины контакта
@@ -137,6 +216,12 @@ LOAD_OVER = RHO_R * G_PHYS * LCELL   # Н: вес столба породы гл
 # прикладывается ПЛАВНО (tau ≈ 0.3 с) — мгновенный полный вес даёт ударный
 # выброс напряжений по связям (ложные разрывы, волны по массиву)
 LOAD_RAMP = 1.0 - math.exp(-TICK / 0.3)
+# темп догонки преднатяга (bpre -> цель по sigVI) за тик: rate=1 - мгновенно
+# (при генерации), rate=LOAD_RAMP - с τ=0.3 с (в тике). Мгновенная погоня за
+# sigVI КАЖДЫЙ тик накачивает упругие волны в массиве (параметрическое
+# возбуждение: brest гонится за осциллирующим полем) - источник "скачущих
+# напряжений". Низкочастотная догонка волн не возбуждает.
+PRESTRESS_RAMP = LOAD_RAMP
 WPRESS = RHO_W * G_PHYS * LCELL      # Н на 1 м напора: сила давления на грань блока 1 клетку
 WSPR = 2000.0 * RHO_R * LCELL        # Н/м: жёсткость упругого контакта вода-блок
 VMAX = 30.0 * LCELL         # м/с: предельная скорость блока (кламп)
@@ -267,6 +352,9 @@ dbgVx1 = ti.field(ti.f32, ())
 dbgPairs = ti.field(ti.i32, ())
 dbgContacts = ti.field(ti.i32, ())
 dbgFixed = ti.field(ti.i32, ())
+# счётчики аварийных overE-обрывов по веткам: 0 = растяжение/деформация,
+# 1 = смятие, 2 = сдвиг/изгиб (диагностика «кто рвёт»)
+dbgBreakN = ti.field(ti.i32, 4)
 # 1 = досыпка обломков сверху (refill_top_overburden) отключена ("Ochistit porodu")
 refillOff = ti.field(ti.i32, ())
 brot = ti.field(ti.f32, MAXB)
@@ -327,6 +415,12 @@ holdL = ti.field(ti.f32, N)
 holdR = ti.field(ti.f32, N)
 
 # связи (bonds) — фиксированные массивы, длина покоя и направление у каждой
+# состояния связи (bondIntact):
+BOND_DEAD = 0    # мёртвая запись (слот свободен / блок удалён) — усилий нет
+BOND_INTACT = 1  # целая связь: нормаль + сдвиг + изгиб + пластика + обрыв
+BOND_JOINT = 2   # разорванный шов: ТОЛЬКО осевое сжатие (замкнутая трещина передаёт
+                 # σ_n = K0·σ_v, растяжение/сдвиг/изгиб невозможны). Наследует престресс
+                 # bpre разорванной связи — поле σ_h непрерывно при разрыве.
 bondA = ti.field(ti.i32, MAXBONDS)
 bondB = ti.field(ti.i32, MAXBONDS)
 bondIntact = ti.field(ti.i32, MAXBONDS)
@@ -346,6 +440,12 @@ bondSlip = ti.field(ti.f32, MAXBONDS)   # накопленное ПЛАСТИЧ�
 bondFlow = ti.field(ti.i32, MAXBONDS)   # 1 = связь сейчас "течёт" пластически (для отрисовки фиолетовым)
 bondCreep = ti.field(ti.f32, MAXBONDS)  # криповое "повреждение" (клетки): рвёт только при УДЕРЖИВАЕМОЙ нагрузке,
                                         # залечивается при разгрузке (кратковременный перегруз не рвёт)
+bondOver = ti.field(ti.f32, MAXBONDS)   # низкочастотный фильтр ОСЕВОГО усилия связи (Н, знак как у
+                                        # tension): крип/текучесть копят СРЕДНЮЮ перегрузку за ~0.15 с,
+                                        # а не мгновенные пики численных колебаний решётки (ω·dt≈0.5).
+                                        # Иначе на большой глубине статика+пик колебаний дают ложный
+                                        # крип и самопроизвольные разрывы («трещины сами по себе»).
+bondSplitAvg = ti.field(ti.f32, MAXBONDS)  # то же окно для пуассонова раскалывающего слагаемого split (Н)
 bondNX = ti.field(ti.f32, MAXBONDS)     # начальное направление связи (единичный вектор)
 bondNY = ti.field(ti.f32, MAXBONDS)
 bondE = ti.field(ti.f32, MAXBONDS)   # накопленная упругая энергия связи
@@ -353,6 +453,10 @@ bondCount = ti.field(ti.i32, shape=())
 # наличие связи между парой блоков — битовая карта (вместо сеточной is_bonded):
 # bondMap[a, b>>5] хранит бит b&31. Перестраивается в count_bonds каждый кадр.
 bondMap = ti.field(ti.i32, (MAXB, BMAPW))
+# hasMap — «у пары ЕСТЬ запись в массиве связей» (целая ИЛИ шов): флаги трещин
+# crackL/crackR ставятся только для пар БЕЗ записи, чтобы распор рыхляка в
+# forces_reset не складывался с усилием сжимаемого шва (двойной счёт σ_h).
+hasMap = ti.field(ti.i32, (MAXB, BMAPW))
 
 # контактный хэш блоков
 hhead = ti.field(ti.i32, N)
@@ -536,25 +640,32 @@ def sigvi_field():
             c = y * COLS + x
             if gOcc[c] == 1:
                 sigVI[c] = carry
-                # вес клетки: плотность однородна, поэтому любая клетка (и любой
-                # блок, покрывающий клетку) даёт одинаковый вклад BMASS_UNIT*g, Н
                 carry += BMASS_UNIT * P[None].g
+            else:
+                # РАЗРЫВ сплошности: вес через пустоту не передаётся (сводовая
+                # разгрузка). Иначе вся вышележащая порода (loadCur + вес колонны)
+                # "давила" на уединённый обломок в дыре: боковой распор, преднатяг
+                # и трение о стенки выходили на 2 порядка больше веса блока -
+                # блоки ОТЛЕТАЛИ при спавне и ПРИЛИПАЛИ к границам/боковым граням.
+                carry = 0.0
             y += 1
 
 
 @ti.func
 def bond_stress_field():
-    """Прокси главных СЖАТИЙ по блокам (bSxx/bSyy) из сил связей.
+    """Прокси главных СЖАТИЙ по блокам (bSxx/bSyy) из сил связей и швов.
 
-    Для каждой целой связи её осевое сжатие раскладывается по осям (× ux²/× uy²)
-    и суммируется на концевые блоки. Направление с большим сжатием — локальное
+    Для каждой целой связи и шва (BOND_JOINT) осевое сжатие раскладывается по осям
+    (× ux²/× uy²) и суммируется на концевые блоки. Швы включены, чтобы разрыв
+    полосы связей не обнулял прокси σ_xx — легенда и пуассоново раскалывание
+    видят сохранённое боковое сжатие. Направление с большим сжатием — локальное
     главное сжатие σ_c: по нему считается пуассоново раскалывание в forces_bonds
     (трещины ВДОЛЬ σ_c — вертикальные в поле, вдоль контура у выработки)."""
     for i in range(bcount[None]):
         bSxx[i] = 0.0
         bSyy[i] = 0.0
     for bd in range(bondCount[None]):
-        if bondIntact[bd] == 1:
+        if bondIntact[bd] != BOND_DEAD:
             a = bondA[bd]
             b = bondB[bd]
             dx = bx[b] - bx[a]
@@ -607,7 +718,7 @@ def refresh_field():
 
 
 @ti.kernel
-def update_prestress(dt: ti.f32):
+def update_prestress(dt: ti.f32, rate: ti.f32):
     """Динамический престресс ГОРИЗОНТАЛЬНЫХ связей: σ_h = K0·σ_v живёт в brest.
 
     Зовётся КАЖДЫЙ тик (step_physics) и при сборке (generate): усилие в связях
@@ -622,7 +733,9 @@ def update_prestress(dt: ti.f32):
     не затирать пластичность bondPlast/creep, которая тоже накапливается в brest:
     сдвиг brest от текучести остаётся, правится только престресс-часть. При этом
     изменение глубины/K0/E в рантайме пересчитывает bpre и сразу меняет усилие,
-    а не «перезапускает» связь с нуля.
+    а не «перезапускает» связь с нуля. ШВЫ (BOND_JOINT) обновляются так же:
+    их сжатие должно следовать за полем σ_h, как и у целых связей, иначе после
+    разрыва полосы связей боковое давление в ней пропадало бы навсегда.
 
     Вертикальные связи НЕ трогаем — их сжатие устанавливает тяжесть (bfy += bmass·g);
     престрессовать их нельзя — будет двойной счёт с гравитацией. Жёсткость k_ax
@@ -641,8 +754,11 @@ def update_prestress(dt: ti.f32):
     вертикальных связях; распор push для связанного массива в forces_reset ОТКЛЮЧЁН
     — иначе двойной счёт с престрессом (см. диагностику Кирша)."""
     for bd in range(bondCount[None]):
-        if bondIntact[bd] == 0:
+        if bondIntact[bd] == BOND_DEAD:
             continue
+        if bondIntact[bd] == BOND_JOINT:
+            continue   # шов несёт только сжатие контакта - без преднатяга
+                       # (см. док: bpre шва не трогаем; иначе шов "толкает" блоки)
         a = bondA[bd]
         b = bondB[bd]
         dx = bx[b] - bx[a]
@@ -670,10 +786,29 @@ def update_prestress(dt: ti.f32):
         # вертикальна (nx²=0) — ничего (её сжатие даёт тяжесть), наклонная —
         # проекцию; вклад вертикального σ_v в связь НЕ добавляем — двойной счёт
         # с гравитацией (bfy += bmass·g) и перегрузом (ovf).
-        F_pre = sigma_h * w * nx * nx   # Н: сжатие, которое должна нести связь
-        bnew = F_pre / k_ax             # м: смещение длины покоя = престресс
-        brest[bd] += bnew - bpre[bd]    # дельта: длина покоя длиннее -> связь обжата
-        bpre[bd] = bnew
+        # Конфайнмент исчезает у СВОБОДНОЙ грани: если внешняя боковая грань
+        # блока открыта (нет соседа/связи), поперечного давления там нет, а
+        # преднатяг сжимал связь на свободной кромке и выдавливал блок наружу
+        # (в т.ч. в стену, где его держало трением). Открытость граней:
+        # faceL/faceR из прошлого подшага (0 = грань закрыта соседом).
+        cover = 1
+        if ti.abs(nx) > 0.5:
+            if bx[a] < bx[b]:
+                if faceL[a] == 1 or faceR[b] == 1:
+                    cover = 0
+            else:
+                if faceL[b] == 1 or faceR[a] == 1:
+                    cover = 0
+        F_pre = sigma_h * w * nx * nx * cover   # Н: сжатие, которое должна нести связь
+        bnew = 0.0
+        if k_ax > 1e-9:
+            bnew = F_pre / k_ax         # Н: смещение длины покоя = преднатяг
+        # догонка цели с темпом rate (см. PRESTRESS_RAMP): rate=1 при генерации,
+        # в тике - низкочастотная релаксация, чтобы brest не гнался за
+        # осциллирующим sigVI (параметрическое возбуждение волн)
+        step = (bnew - bpre[bd]) * rate
+        brest[bd] += step
+        bpre[bd] += step
 
 
 @ti.func
@@ -736,6 +871,8 @@ def add_bond_func(a: ti.i32, b: ti.i32, rest: ti.f32, intact: ti.i32):
         bondSlip[i] = 0.0
         bondFlow[i] = 0
         bondCreep[i] = 0.0
+        bondOver[i] = 0.0
+        bondSplitAvg[i] = 0.0
         dx = bx[b] - bx[a]
         dy = by[b] - by[a]
         d = ti.sqrt(dx * dx + dy * dy)
@@ -766,6 +903,23 @@ def is_bonded_bit(a: ti.i32, b: ti.i32) -> ti.i32:
 
 
 @ti.func
+def set_has_bit(a: ti.i32, b: ti.i32):
+    ti.atomic_or(hasMap[a, b >> 5], 1 << (b & 31))
+    ti.atomic_or(hasMap[b, a >> 5], 1 << (a & 31))
+
+
+@ti.func
+def clear_has_bit(a: ti.i32, b: ti.i32):
+    ti.atomic_and(hasMap[a, b >> 5], ~(1 << (b & 31)))
+    ti.atomic_and(hasMap[b, a >> 5], ~(1 << (a & 31)))
+
+
+@ti.func
+def is_has_bit(a: ti.i32, b: ti.i32) -> ti.i32:
+    return (hasMap[a, b >> 5] >> (b & 31)) & 1
+
+
+@ti.func
 def remove_block_func(rem: ti.i32):
     """Удалить блок: связи с ним умирают, последний блок переносится на его место."""
     i = 0
@@ -773,8 +927,9 @@ def remove_block_func(rem: ti.i32):
         a = bondA[i]
         b = bondB[i]
         if a == rem or b == rem:
-            bondIntact[i] = 0
+            bondIntact[i] = BOND_DEAD
             clear_bond_bit(a, b)
+            clear_has_bit(a, b)
         i += 1
     last = bcount[None] - 1
     # очистить память трения о жёстких границах для удаляемого и переносимого
@@ -825,28 +980,42 @@ def remove_block_func(rem: ti.i32):
         hy[rem] = hy[last]
         i = 0
         while i < bondCount[None]:
-            if bondIntact[i] == 1:
-                a = bondA[i]
-                b = bondB[i]
-                if a == last:
-                    bondA[i] = rem
-                elif b == last:
-                    bondB[i] = rem
+            a = bondA[i]
+            b = bondB[i]
+            if a == last:
+                bondA[i] = rem
+            elif b == last:
+                bondB[i] = rem
             i += 1
     bcount[None] -= 1
 
 
 @ti.kernel
 def compact_bonds():
+    """Уплотнение массива связей: мёртвые записи (BOND_DEAD) выбрасываются,
+    целые связи и ШВЫ (BOND_JOINT) сохраняются — шов несёт сжатие σ_n и не
+    должен исчезать при «пересборке», иначе поле σ_h снова пропадёт после разрыва.
+    Клапан переполнения: при нехватке слотов (>85% MAXBONDS) выбрасываются швы
+    с раскрытием больше CONTACT_CLOSE_TOL — по условию «только сомкнутые трещины»
+    они всё равно не передают усилие."""
     n = 0
     i = 0
+    tight = bondCount[None] * 20 > MAXBONDS * 17   # > 85% слотов занято
     while i < bondCount[None]:
         a = bondA[i]
         b = bondB[i]
-        if bondIntact[i] == 1:
+        st = bondIntact[i]
+        keep = 1 if st != BOND_DEAD else 0
+        if tight == 1 and st == BOND_JOINT:
+            dx = bx[b] - bx[a]
+            dy = by[b] - by[a]
+            d = ti.sqrt(dx * dx + dy * dy)
+            if d > brest[i] + CONTACT_CLOSE_TOL:
+                keep = 0
+        if keep == 1:
             bondA[n] = a
             bondB[n] = b
-            bondIntact[n] = 1
+            bondIntact[n] = st
             bondR[n] = bondR[i]
             bondDmg[n] = bondDmg[i]
             bondJ[n] = bondJ[i]
@@ -856,6 +1025,8 @@ def compact_bonds():
             bondSlip[n] = bondSlip[i]
             bondFlow[n] = bondFlow[i]
             bondCreep[n] = bondCreep[i]
+            bondOver[n] = bondOver[i]
+            bondSplitAvg[n] = bondSplitAvg[i]
             bondNX[n] = bondNX[i]
             bondNY[n] = bondNY[i]
             bondE[n] = bondE[i]
@@ -942,8 +1113,18 @@ def fracture_bond(bd: ti.i32, a: ti.i32, b: ti.i32, crush: ti.i32,
                   strain: ti.f32, shear: ti.f32, relb: ti.f32):
     """Разрыв связи: вся накопленная упругая энергия bondE[bd]
     одномоментно переходит в кинетическую энергию осколков.
-    Направление — по оси связи (нормаль) + касательная (сдвиг)."""
-    bondIntact[bd] = 0
+    Направление — по оси связи (нормаль) + касательная (сдвиг).
+
+    Связь НЕ удаляется, а становится швом (BOND_JOINT): она теряет растяжение,
+    сдвиг и изгиб, но сохраняет осевое СЖАТИЕ (brest/bpre не трогаем — шов
+    наследует престресс разорванной связи, поле σ_h непрерывно при разрыве).
+    hasMap-бит пары остаётся — запись связи жива, флаги трещин crackL/crackR
+    для этой пары не ставятся (иначе распор рыхляка сложится с усилием шва)."""
+    bondIntact[bd] = BOND_DEAD   # как в коммите: разорванная связь мертва.
+    # Было BOND_JOINT: тогда разрыв превращался в шов, который update_prestress
+    # продолжал СЖИМАТЬ конфайнментом (F_pre = σ_h·w до ~1e4 Н) - "сломанные"
+    # связи продолжали толкать блоки (ax ~ 20 м/с² в стену) и блоки висели
+    # в воздухе (см. mineudec4 - версия без зависаний, там разрыв = смерть).
     clear_bond_bit(a, b)
     break_event(a, b, crush)
 
@@ -1136,8 +1317,21 @@ def friction_vec(i: ti.i32, j: ti.i32, key: ti.i32, vt: ti.f32, Fn: ti.f32, dt: 
         ti.atomic_add(btor[i], -Ft * (rix * ty - riy * tx))
         ti.atomic_add(btor[j], Ft * (rjx * ty - rjy * tx))
 
-SUBSTEPS = 192
+SUBSTEPS = max(64, min(2048, int(os.environ.get("MINEUDEC_SUBSTEPS",
+                                                str(int(round(TICK / ((1.0 / 60.0) / 384))))))))
 DT = TICK / SUBSTEPS              # с: подшаг интегрирования DEM внутри тика
+# Иерархия времени: 1 ШАГ СИМУЛЯЦИИ (тик) = TICK = 1/60 с модели = 1 кадр GUI;
+# внутри тика - SUBSTEPS ПОДШАГОВ по dt = TICK/SUBSTEPS (явный интегратор DEM).
+# Больше подшагов -> меньше dt -> точнее и стабильнее (критерий ω·dt):
+#   192 -> ω·dt ≈ 1.0  (на грани: массив "звенел", напряжения прыгали);
+#   256 -> ω·dt ≈ 0.75 (медленный набор энергии);
+#   384 -> ω·dt ≈ 0.5  (устойчиво и тихо - БАЛАНС по умолчанию);
+#   512 -> ω·dt ≈ 0.37 (запас точности, +33% к стоимости);
+#   768 -> ω·dt ≈ 0.25 (макс. точность, x2 к стоимости).
+# Стоимость тика растёт ЛИНЕЙНО с SUBSTEPS (каждый подшаг - лаунч phys_substep).
+# Пересборка геометрии (ТОРО) идёт раз в 0.25 тика НЕЗАВИСИМО от SUBSTEPS
+# (TOPO_EVERY масштабируется) - их число на тик не растёт.
+# Подобрать: MINEUDEC_SUBSTEPS=384|512|768 python mineudec.py
 # ПРЕДЕЛ УСТОЙЧИВОСТИ явной схемы (симплектический Эйлер): частота пары
 # ω=√(k/m_red) должна давать ω·dt ≤ ~0.5, тогда худшая мода решётки (цепочка
 # пружин + вращение, до ~4×ω пары) остаётся внутри границы устойчивости ω·dt<2.
@@ -1148,17 +1342,21 @@ DT = TICK / SUBSTEPS              # с: подшаг интегрировани�
 # себя на первом же тике. Кап не меняет ПРОЧНОСТЬ (Ftmax/Fcmax от k не зависят),
 # лишь делает пружину чуть мягче (деформации и так микроскопические).
 STAB_C = 0.25
-TOPO_EVERY = 48   # пересборка топологии (хэш, nbond, поля напряжений) каждые N подшагов:
-                  # слишком частая (12) усиливает вертикальные трещины сверху при большой нагрузке,
-                  # 48 — баланс между свежестью топологии и стабильностью
+TOPO_EVERY = max(16, SUBSTEPS // 4)   # пересборка топологии (хэш, nbond, поля напряжений)
+                  # каждые N подшагов = каждые 0.25 тика (как исходные 48 из 192):
+                  # слишком частая (12) усиливает вертикальные трещины сверху при
+                  # большой нагрузке; 0.25 тика - баланс свежести и стабильности,
+                  # масштабируется с SUBSTEPS автоматически
 FRIC_FORGET_T = 3.0 * TICK        # с: как долго "помнить" накопленный сдвиг трения
 COMPACT_EVERY_T = 0.5             # с: период пересборки/уплотнения связей
 # Демпфирование скорости и вращения блоков (задумано НА ТИК, применяется на подшаг —
 # в phys_integrate множители пересчитываются как base^(dt/TICK), см. там):
-DAMP_FREE_TICK = 0.9995    # свободный полёт обломка: почти без гашения (реальное падение)
-DAMP_SUPP_TICK = 0.9975    # связанный/опирающийся блок: оседание, устойчивость массива
-DAMP_ROT_FREE_TICK = 0.992 # вращение свободного обломка (кувыркание)
-DAMP_ROT_BOND_TICK = 0.97  # вращение блока в составе массива
+DAMP_FREE_TICK = 0.9995 ** (TICK * 60.0)    # свободный полёт обломка: почти без гашения (реальное падение)
+DAMP_SUPP_TICK = 0.993 ** (TICK * 60.0)    # связанный/опирающийся блок: оседание, устойчивость массива.
+                          # Было 0.9975 - слишком слабо для гашения упругого звона
+                          # по связному массиву (напряжения прыгали по всем блокам).
+DAMP_ROT_FREE_TICK = 0.992 ** (TICK * 60.0) # вращение свободного обломка (кувыркание)
+DAMP_ROT_BOND_TICK = 0.97 ** (TICK * 60.0)  # вращение блока в составе массива
 SLEEP_V2 = 1.5e-3 * LCELL * LCELL     # (м/с)²: порог скорости "уснувшего" блока
 SLEEP_A2 = 4.0 * LCELL * LCELL        # (м/с²)²: порог ускорения — блок спит только
                                   # если почти неподвижен И силы уравновешены (лежит на опоре), иначе

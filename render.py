@@ -9,6 +9,7 @@ bulk-загрузкой build_model). Решатель ничего не зна�
 """
 
 import argparse
+import heapq
 import math
 import random
 import time
@@ -26,6 +27,12 @@ PX = CELL / LCELL
 # модели на регулярной сетке; в физике их нет)
 cutR = ti.field(ti.i32, N)
 cutD = ti.field(ti.i32, N)
+# полилиния трещины (2 клика -> A* -> разрыв связей вдоль пути), в клетках
+pathX = ti.field(ti.f32, 1024)
+pathY = ti.field(ti.f32, 1024)
+pathN = ti.field(ti.i32, ())
+bondPath = ti.field(ti.i32, 1024)   # индексы целых связей по пути трещины
+bondN = ti.field(ti.i32, ())        # сколько связей в bondPath
 noisePts = ti.field(ti.f32, 128)
 n1Arr = ti.field(ti.f32, COLS)
 n2Arr = ti.field(ti.f32, COLS)
@@ -51,6 +58,7 @@ CAM_ZMAX = 8.0
 # поля — каждый read скалярного поля из Python это синхронизация CPU<->GPU.
 # GPU-ядра рендера по-прежнему читают поля CAMX/CAMY/CAMZ.
 _CAM = [0.0, 0.0, 1.0]
+panel_visible = True   # панель управления (клавиша P / кнопка) — зона ввода 0.71
 
 
 def cam_write(ox, oy, oz):
@@ -129,6 +137,28 @@ def poll_type_chars():
     return out
 
 
+# numpad +/- — зум камеры; события ti.ui их не приносят (как цифры), поэтому
+# опросом GetAsyncKeyState с автоповтором ~8 Гц при удержании.
+_VK_ADD = 0x6B
+_VK_SUB = 0x6D
+_zoom_next = {0x6B: 0.0, 0x6D: 0.0}
+
+
+def poll_zoom_keys(now):
+    """+1/-1/0 — шаг зума за кадр (numpad +/-), с автоповтором при удержании."""
+    if not _app_focused():
+        return 0
+    step = 0
+    for vk, sgn in ((_VK_ADD, 1), (_VK_SUB, -1)):
+        down = (_user32.GetAsyncKeyState(vk) & 0x8000) != 0
+        if not down:
+            _zoom_next[vk] = 0.0
+        elif now >= _zoom_next[vk]:
+            step += sgn
+            _zoom_next[vk] = now + 0.125
+    return step
+
+
 def parse_deg(buf):
     try:
         return float(buf.replace(",", "."))
@@ -142,11 +172,36 @@ AMBER = ti.Vector([0.961, 0.647, 0.141])
 CYAN = ti.Vector([0.239, 0.784, 1.0])
 FIXED = ti.Vector([0.169, 0.212, 0.267])
 CRACK = ti.Vector([0.0167, 0.0267, 0.04])
-ORANGE = ti.Vector([0.75, 0.312, 0.179])
-BLUE = ti.Vector([0.261, 0.395, 0.546])
+ORANGE = ti.Vector([0.96, 0.30, 0.14])
+BLUE = ti.Vector([0.22, 0.62, 0.96])
 PURPLE = ti.Vector([0.72, 0.32, 0.9])
 JOINT = ti.Vector([0.34, 0.41, 0.48])
 WHITE = ti.Vector([1.0, 1.0, 1.0])
+
+# --- палитра шкал напряжений: по 10 ступеней на шкалу ---------------------
+# Растяжение — тёплая шкала (бордовый -> красный -> оранжевый -> жёлтый),
+# сжатие — холодная (тёмно-синий -> синий -> голубой -> белёсый). Яркость
+# ступеней растёт равномерно: соседние квадраты легенды различаются чётко,
+# а две шкалы мгновенно различаются по оттенку. Цвета ТОЧНЫЕ (без сглаженной
+# интерполяции): квадрат легенды, блок и линия связи одного интервала всегда
+# одного цвета.
+BAND_RGB = (
+    (   # шкала растяжения (0)
+        (122, 30, 45), (158, 36, 42), (190, 42, 38), (216, 55, 32),
+        (234, 74, 26), (244, 100, 24), (250, 130, 30), (253, 162, 42),
+        (255, 195, 62), (255, 226, 110),
+    ),
+    (   # шкала сжатия (1)
+        (28, 48, 112), (32, 72, 156), (36, 98, 194), (42, 124, 220),
+        (52, 150, 236), (72, 172, 243), (100, 192, 247), (136, 210, 250),
+        (176, 226, 251), (216, 241, 253),
+    ),
+)
+bandCol = ti.field(ti.f32, (2, 10, 3))
+for _bi in range(2):
+    for _k in range(10):
+        for _c in range(3):
+            bandCol[_bi, _k, _c] = BAND_RGB[_bi][_k][_c] / 255.0
 
 
 @ti.func
@@ -297,16 +352,6 @@ def render_triangles(t: ti.f32, on: ti.i32):
 
 
 @ti.func
-def stress_u(q: ti.f32) -> ti.f32:
-    """Интенсивность цвета напряжения (0..1): гладкая кривая до предела
-    прочности (q=1), выше — насыщенный. Та же функция для блоков и легенды."""
-    u = q if q > 1.0 else q * q * (3.0 - 2.0 * q)
-    if u > 1.0:
-        u = 1.0
-    return u
-
-
-@ti.func
 def stress_band(q: ti.f32, pk: ti.f32) -> ti.i32:
     """Номер цветового интервала 0..9 для напряжения q (нормировано на прочность)
     при пике шкалы pk: шкала разбита на 10 равных интервалов 0..pk."""
@@ -323,23 +368,29 @@ def stress_band(q: ti.f32, pk: ti.f32) -> ti.i32:
 
 @ti.func
 def legend_band_color(scale: ti.i32, k: ti.i32):
-    """Цвет интервала k (0..9) шкалы легенды: scale 0 — растяжение
-    (серый->красный), 1 — сжатие (серый->синий). Одна функция и для квадратов
-    легенды, и для блоков — поэтому цвет блока всегда совпадает с квадратом
-    своего интервала на шкале."""
-    uu = stress_u((k + 1.0) / 10.0)
-    r = 112.0
-    g = 121.0
-    b = 134.0
-    if scale == 0:
-        r = r + (255.0 - r) * uu
-        g = g + (101.0 - g) * uu
-        b = b + (58.0 - b) * uu
-    else:
-        r = r + (96.0 - r) * uu
-        g = g + (152.0 - g) * uu
-        b = b + (228.0 - b) * uu
-    return ti.Vector([r / 255.0, g / 255.0, b / 255.0])
+    """Цвет интервала k (0..9) шкалы: scale 0 — растяжение (тёплая шкала),
+    1 — сжатие (холодная). Точный цвет из палитры BAND_RGB — один и тот же
+    для квадрата легенды, блока и линии связи своего интервала."""
+    return ti.Vector([bandCol[scale, k, 0], bandCol[scale, k, 1], bandCol[scale, k, 2]])
+
+
+@ti.func
+def ramp_color(scale: ti.i32, t: ti.f32):
+    """Непрерывный цвет шкалы для t в 0..1: кусочно-линейно по ступеням палитры
+    (для заливки блоков — градиент без «ступенек», те же цвета, что у легенды)."""
+    tt = t
+    if tt < 0.0:
+        tt = 0.0
+    if tt > 1.0:
+        tt = 1.0
+    x = tt * 9.0
+    k0 = int(x)
+    if k0 > 8:
+        k0 = 8
+    f = x - k0
+    c0 = legend_band_color(scale, k0)
+    c1 = legend_band_color(scale, k0 + 1)
+    return c0 + (c1 - c0) * f
 
 
 @ti.kernel
@@ -380,30 +431,9 @@ def render_blocks(show: ti.i32):
             r = 112.0 + s * 26.0
             g = 121.0 + s * 24.0
             b = 134.0 + s * 22.0
-            tq = bstress[i]
-            cq = bstressC[i]
-            # СРАВНЕНИЕ В ФИЗИЧЕСКИХ ЕДИНИЦАХ: bstress нормирован на Ftmax,
-            # а bstressC — на Fcmax = rcFactor*Ftmax, поэтому сжатие,
-            # приведённое к шкале Ftmax, равно cq*rcFactor. Раньше пороги были
-            # 0.03 против 0.05 в РАЗНЫХ шкалах (сжатие требовало в 16.7 раз
-            # большего напряжения) и растяжение всегда "побеждало": блок с
-            # доминирующим сжатием подсвечивался красным, и картина изгиба
-            # выглядела перевёрнутой (сверху растяжение / снизу сжатие).
-            tphy = tq
-            cphy = cq * P[None].rcFactor
-            # �� �����񭭮� ������� (show=1) ����� �� ���訢����� �� 誠��:
-            # 梥� 誠�� ����� ����� �痢� (render_bonds, scale=1)
-            if show == 0 and (tphy > 0.03 or cphy > 0.03):
-                if tphy >= cphy:
-                    u = tq if tq > 1.0 else tq * tq * (3.0 - 2.0 * tq)
-                    r = r + (255.0 - r) * u
-                    g = g + (101.0 - g) * u
-                    b = b + (58.0 - b) * u
-                else:
-                    u = cq if cq > 1.0 else cq * cq * (3.0 - 2.0 * cq)
-                    r = r + (96.0 - r) * u
-                    g = g + (152.0 - g) * u
-                    b = b + (228.0 - b) * u
+            # Закраска блоков по напряжениям (сжатие/растяжение) убрана:
+            # блоки всегда рисуются телом (серый тон + шум bshade).
+            # Напряжения показывают связи (render_bonds) и легенда шкал.
             col = ti.Vector([r / 255.0, g / 255.0, b / 255.0])
             if ti.abs(brot[i]) > 0.02:
                 fill_rot_rect(bx[i] * PX * z + ox, H - 1 - (by[i] * PX * z + oy), brot[i], ri, col)
@@ -570,7 +600,7 @@ def render_bonds(show: ti.i32, scale: ti.i32):
         ox = CAMX[None]
         oy = CAMY[None]
         for bd in range(bondCount[None]):
-            if bondIntact[bd] == 1:
+            if bondIntact[bd] != BOND_DEAD:
                 r = bondR[bd]
                 a = bondA[bd]
                 b = bondB[bd]
@@ -597,7 +627,7 @@ def render_joints():
     ox = CAMX[None]
     oy = CAMY[None]
     for bd in range(bondCount[None]):
-        if bondIntact[bd] == 0:
+        if bondIntact[bd] != BOND_INTACT:
             continue
         a = bondA[bd]
         b = bondB[bd]
@@ -646,20 +676,23 @@ def render_cracks():
         mx = (bx[a] + bx[b]) * 0.5 * PX * z + ox
         my = H - 1 - ((by[a] + by[b]) * 0.5 * PX * z + oy)
         j = bondJ[bd] * PX * z
-        hl = ti.min(bsz[a], bsz[b]) * PX * z * 0.55
-        # засечка трещины ПОПЕРЁК связи, полюс скольжения j ВДОЛЬ связи;
+        half = ti.min(bsz[a], bsz[b]) * PX * z * 0.5
         # оси буфера (мир y вниз -> Y вверх): вдоль связи (ux, -uy), поперёк (uy, ux).
-        # Раньше засечка была жёстко вертикаль/горизонталь по мировым осям
-        # (ветвление |dx|>=|dy|) — на повёрнутой модели трещины не лежали поперёк
-        # шва, а «провернуты» так же, как засечки связей.
         ux = dx / d
         uy = dy / d
         tx = ux
         ty = -uy
         nx = uy
         ny = ux
-        draw_line(mx + 0.4 * j * tx - hl * nx, my + 0.4 * j * ty - hl * ny,
-                  mx - 0.4 * j * tx + hl * nx, my - 0.4 * j * ty + hl * ny, CRACK, 2.0)
+        # линия ШВА: вся грань от угла до угла. Путь трщины идёт по сетке
+        # границ блоков (см. crack_line) - подряд идущие разрывы стыкуются
+        # углами, поэтому шов читается сплошной линией на любом угле.
+        draw_line(mx - half * nx, my - half * ny,
+                  mx + half * nx, my + half * ny, CRACK, 2.0)
+        # полюс скольжения: короткая засечка ВДОЛЬ связи со смещением
+        if ti.abs(j) > 0.05:
+            draw_line(mx + 0.05 * j * tx, my + 0.05 * j * ty,
+                      mx + 0.75 * j * tx, my + 0.75 * j * ty, CRACK, 1.0)
 
 
 @ti.kernel
@@ -718,6 +751,20 @@ def render_mouse(mx: ti.f32, my: ti.f32, brush: ti.f32, is_water: ti.i32):
         else:
             r = (brush / 2.0 + 0.3) * CELL * z
             draw_circle_outline(X, Y, r, AMBER * 0.7, 1.5)
+
+
+@ti.kernel
+def render_rubber(x0: ti.f32, y0: ti.f32, x1: ti.f32, y1: ti.f32):
+    # резиновая линия трещины: от первой точки до курсора (как в AutoCAD)
+    z = CAMZ[None]
+    X0 = x0 * CELL * z + CAMX[None]
+    Y0 = H - 1 - (y0 * CELL * z + CAMY[None])
+    X1 = x1 * CELL * z + CAMX[None]
+    Y1 = H - 1 - (y1 * CELL * z + CAMY[None])
+    draw_line(X0, Y0, X1, Y1, AMBER, 1.0)
+    # крестик на первой точке
+    draw_line(X0 - 6, Y0, X0 + 6, Y0, AMBER, 1.0)
+    draw_line(X0, Y0 - 6, X0, Y0 + 6, AMBER, 1.0)
 
 
 # ================================================================== генерация модели
@@ -830,9 +877,9 @@ def gen_tunnel(weak: ti.i32):
         a = r_block[c]
         if a >= 0:
             if (c % COLS) < COLS - 1 and r_block[c + 1] >= 0:
-                add_bond_func(a, r_block[c + 1], 1.0, 1 if cutR[c] == 0 else 0)
+                add_bond_func(a, r_block[c + 1], 1.0, 1 if cutR[c] == 0 else BOND_JOINT)
             if (c // COLS) < ROWS - 1 and r_block[c + COLS] >= 0:
-                add_bond_func(a, r_block[c + COLS], 1.0, 1 if cutD[c] == 0 else 0)
+                add_bond_func(a, r_block[c + COLS], 1.0, 1 if cutD[c] == 0 else BOND_JOINT)
         c += 1
 
 
@@ -915,9 +962,9 @@ def gen_slope(weak: ti.i32):
         a = r_block[c]
         if a >= 0:
             if (c % COLS) < COLS - 1 and r_block[c + 1] >= 0:
-                add_bond_func(a, r_block[c + 1], 1.0, 1 if cutR[c] == 0 else 0)
+                add_bond_func(a, r_block[c + 1], 1.0, 1 if cutR[c] == 0 else BOND_JOINT)
             if (c // COLS) < ROWS - 1 and r_block[c + COLS] >= 0:
-                add_bond_func(a, r_block[c + COLS], 1.0, 1 if cutD[c] == 0 else 0)
+                add_bond_func(a, r_block[c + COLS], 1.0, 1 if cutD[c] == 0 else BOND_JOINT)
         c += 1
     k = 0
     while k < 240:
@@ -951,9 +998,9 @@ def gen_solid():
         a = r_block[c]
         if a >= 0:
             if (c % COLS) < COLS - 1 and r_block[c + 1] >= 0:
-                add_bond_func(a, r_block[c + 1], 1.0, 1 if cutR[c] == 0 else 0)
+                add_bond_func(a, r_block[c + 1], 1.0, 1 if cutR[c] == 0 else BOND_JOINT)
             if (c // COLS) < ROWS - 1 and r_block[c + COLS] >= 0:
-                add_bond_func(a, r_block[c + COLS], 1.0, 1 if cutD[c] == 0 else 0)
+                add_bond_func(a, r_block[c + COLS], 1.0, 1 if cutD[c] == 0 else BOND_JOINT)
         c += 1
 
 
@@ -1042,7 +1089,7 @@ def gen_tilted(weak: ti.i32, ct: ti.f32, st: ti.f32, cav: ti.i32):
                 if b >= 0:
                     intact = 1
                     if weak == 1 and (vv == WV1 or vv == WV2):
-                        intact = 0
+                        intact = BOND_JOINT
                     add_bond_func(a, b, 1.0, intact)
 
 
@@ -1155,7 +1202,7 @@ def generate(mode, weak, tilt_deg=0.0):
     # зовётся КАЖДЫЙ тик в step_physics и динамически следует за глубиной/K0 и рампой.
     loadCur[None] = 0.0
     refresh_field()
-    update_prestress(DT)
+    update_prestress(DT, 1.0)
 
 
 @ti.kernel
@@ -1163,9 +1210,19 @@ def rebuild_occ():
     for c in range(N):
         r_block[c] = -1
     for i in range(bcount[None]):
-        cxi = clamp_cell(bx[i])
-        cyi = clamp_cell(by[i])
-        r_block[cyi * COLS + cxi] = i
+        # Полный AABB блока (с учётом поворота), а не только центральная клетка:
+        # иначе блок, сдвинувшийся или повёрнутый со "своей" клетки, накрывает
+        # соседние, кисть штампует новый блок ВПЕРЕКРЫСТ ему - гигантское
+        # проникновение (kконтакта=1e9) вышибает старые блоки ("отлетают"),
+        # рвёт связи ("ломают") и прилипает к их боковым граням ("висят").
+        r = block_prj(i)
+        x0 = clamp_cell(bx[i] - r + 1e-4)
+        x1 = clamp_cell(bx[i] + r - 1e-4)
+        y0 = row_cell(by[i] - r + 1e-4)
+        y1 = row_cell(by[i] + r - 1e-4)
+        for cy in range(y0, y1 + 1):
+            for cx in range(x0, x1 + 1):
+                r_block[cy * COLS + cx] = i
 
 
 # ================================================================== инструменты
@@ -1187,6 +1244,9 @@ def stamp_rock(x: ti.f32, y: ti.f32, r: ti.f32):
                         fixed = 1 if ay >= ROWS - P[None].fixedRows else 0
                         i = add_block_func(ax + 0.5, ay + 0.5, 1.0, fixed)
                         if i >= 0:
+                            # Кисть "Poroda" - материал как в массиве: полные связи
+                            # с соседями (так задают конструкции: балки, плиты,
+                            # перекрытия держатся связями). Как в исходном коммите.
                             if ax > 0 and r_block[cell - 1] >= 0:
                                 add_bond_func(r_block[cell - 1], i, 1.0, 1)
                             if ax < COLS - 1 and r_block[cell + 1] >= 0:
@@ -1224,7 +1284,7 @@ def crack_at(x: ti.f32, y: ti.f32, r: ti.f32):
             if mx * mx + my * my < r2:
                 a = bondA[bd]
                 b = bondB[bd]
-                bondIntact[bd] = 0
+                bondIntact[bd] = BOND_JOINT
                 clear_bond_bit(a, b)
                 ti.atomic_add(broken[None], 1)
                 breakCrush[None] = 0
@@ -1240,6 +1300,39 @@ def crack_at(x: ti.f32, y: ti.f32, r: ti.f32):
                 bvy[a] -= ky
                 bvx[b] += kx
                 bvy[b] += ky
+
+
+@ti.kernel
+def crack_break_path():
+    """Разрыв ровно по цепочке связей bondPath (индексы целых связей).
+
+    Путь собирается в crack_line по графу связей: каждая ступенька пути —
+    уже реальная связь, поэтому разрывы идут сплошной цепочкой без дыр на
+    любых углах, размерах блоков и разрезах слоёв."""
+    n = bondN[None]
+    for bd in range(bondCount[None]):
+        if bondIntact[bd] == 1:
+            for i in range(n):
+                if bondPath[i] == bd:
+                    bondIntact[bd] = BOND_JOINT
+                    clear_bond_bit(bondA[bd], bondB[bd])
+                    ti.atomic_add(broken[None], 1)
+                    breakCrush[None] = 0
+                    a = bondA[bd]
+                    b = bondB[bd]
+                    dx = bx[b] - bx[a]
+                    dy = by[b] - by[a]
+                    d = ti.sqrt(dx * dx + dy * dy)
+                    kx = 0.15
+                    ky = 0.0
+                    if d > 1e-9:
+                        kx = dx / d * 0.15
+                        ky = dy / d * 0.15
+                    bvx[a] -= kx
+                    bvy[a] -= ky
+                    bvx[b] += kx
+                    bvy[b] += ky
+                    break
 
 
 @ti.kernel
@@ -1340,6 +1433,14 @@ def cursor_to_cells(pos):
     return mx, my
 
 
+def panel_zone(pos):
+    """Клик под панелью (правые 29% окна) — только когда панель ВИДИМА.
+
+    Раньше проверка pos[0] > 0.71 стояла жёстко в пяти местах и блокировала
+    кисть/курсор даже при скрытой панели."""
+    return panel_visible and pos[0] > 0.71
+
+
 # зум мышью: масштабируется к точке под курсором, чтобы она осталась на месте
 def zoom_at(pos, factor):
     z0 = _CAM[2]
@@ -1355,7 +1456,13 @@ def zoom_at(pos, factor):
 
 
 def reset_camera():
-    cam_write(0.0, 0.0, 1.0)
+    # Масштаб 0.95 (клетка ~15.2 px): отступ ~26 px со всех сторон - сверху
+    # полоса нагрузки, снизу барьер, слева фон - всё видно, блоки почти
+    # как исходные 16 px. Центр по всему окну (справа за панелью).
+    z = 0.95
+    ox = (W - W * z) * 0.5
+    oy = (H - H * z) * 0.5
+    cam_write(ox, oy, z)
 
 
 def do_stroke(mx, my, last_mx, last_my, tool, brush):
@@ -1364,7 +1471,6 @@ def do_stroke(mx, my, last_mx, last_my, tool, brush):
     dist = math.hypot(dx, dy)
     steps = max(1, int(math.ceil(dist / 0.35)))
     r_rock = brush / 2.0 + 0.4
-    r_crack = brush / 2.0 + 0.25
     if tool == 0:
         rebuild_occ()
     for s in range(1, steps + 1):
@@ -1373,11 +1479,268 @@ def do_stroke(mx, my, last_mx, last_my, tool, brush):
         y = last_my + dy * t
         if tool == 0:
             stamp_rock(x, y, r_rock)
-        elif tool == 1:
-            crack_at(x, y, r_crack)
         elif tool == 3:
             stamp_erase(x, y, r_rock)
     return mx, my
+
+
+def crack_line(x0, y0, x1, y1):
+    """Трещина от точки к точке — НЕПРЕРЫВНЫЙ шов ПРИМЕРНО ПО НАРИСОВАННОЙ ЛИНИИ.
+
+    Путь идёт по ЛИНИЯМ СЕТКИ (границам блоков, целые координаты) от угла
+    к углу: «шла трещина, пришла к краю — и у неё был выбор, куда дальше».
+    Каждый единичный шаг по сетке — ровно одна грань (одна связь), которую
+    трещина рвёт; подряд идущие грани стыкуются углами, поэтому шов
+    НЕПРЕРЫВЕН на любом угле: горизонталь/вертикаль — сплошная линия вдоль
+    границы, диагональ — лесенкой. «Прыжков сквозь блоки» не бывает: путь
+    физически не может зайти в тело блока (только по границам).
+
+    Шов идёт ТОЛЬКО в коридоре вдоль нарисованной линии (отступ не больше
+    CRACK_CORR клеток) — трещина не уползает от линии, например вдоль стенки
+    пустоты. Концы тоже НЕ привязываются к ближайшей точке: старт и цель
+    берутся как углы, ближайшие к началу и концу линии ВДОЛЬ неё, поэтому
+    клик по пустоте продолжает шов там, где линия встречает породу, а не
+    тащит его к случайному углу. Если цель недостижима (пустота поперёк
+    линии), шов рвётся вдоль линии с обеих сторон пустоты. A* по углам:
+    стоимость шага = длина + 2.0 * отступ середины грани от линии.
+    Углы (целые координаты, в клетках) пишутся в pathX/pathY.
+    Модель должна быть в ориентации «как сгенерирована» (как и раньше)."""
+    A = bondA.to_numpy()
+    B = bondB.to_numpy()
+    INT = bondIntact.to_numpy()
+    bxv = bx.to_numpy()
+    byv = by.to_numpy()
+    bszv = bsz.to_numpy()
+    nb = int(bondCount[None])
+    if nb == 0:
+        return 0
+    # карта сегментов сетки: каждая целая связь даёт ключи единичных
+    # отрезков её грани (грань большого блока = несколько сегментов).
+    # Ключ: (0, ix, iy) — горизонтальный отрезок (ix,iy)-(ix+1,iy) [грань y=iy];
+    #       (1, ix, iy) — вертикальный  (ix,iy)-(ix,iy+1) [грань x=ix].
+    seg2bond = {}
+    for bd in range(nb):
+        if INT[bd] != 1:
+            continue
+        a = int(A[bd])
+        b = int(B[bd])
+        fx = (bxv[a] + bxv[b]) * 0.5 / LCELL
+        fy = (byv[a] + byv[b]) * 0.5 / LCELL
+        ax0 = bxv[a] / LCELL - bszv[a] / (2.0 * LCELL)
+        ax1 = bxv[a] / LCELL + bszv[a] / (2.0 * LCELL)
+        ay0 = byv[a] / LCELL - bszv[a] / (2.0 * LCELL)
+        ay1 = byv[a] / LCELL + bszv[a] / (2.0 * LCELL)
+        bx0 = bxv[b] / LCELL - bszv[b] / (2.0 * LCELL)
+        bx1 = bxv[b] / LCELL + bszv[b] / (2.0 * LCELL)
+        by0 = byv[b] / LCELL - bszv[b] / (2.0 * LCELL)
+        by1 = byv[b] / LCELL + bszv[b] / (2.0 * LCELL)
+        if abs(bxv[a] - bxv[b]) < abs(byv[a] - byv[b]):
+            # связь вертикальная -> грань горизонтальная (y = iy, x-диапазон)
+            iy = int(round(fy))
+            x0i = int(round(max(ax0, bx0)))
+            x1i = int(round(min(ax1, bx1)))
+            for ix in range(x0i, x1i):
+                seg2bond[(0, ix, iy)] = bd
+        else:
+            # связь горизонтальная -> грань вертикальная (x = ix, y-диапазон)
+            ix = int(round(fx))
+            y0i = int(round(max(ay0, by0)))
+            y1i = int(round(min(ay1, by1)))
+            for iy in range(y0i, y1i):
+                seg2bond[(1, ix, iy)] = bd
+    if not seg2bond:
+        return 0
+    # направление нарисованной линии
+    ldx = x1 - x0
+    ldy = y1 - y0
+    l2 = ldx * ldx + ldy * ldy
+    LLEN = math.sqrt(l2) if l2 > 1e-9 else 0.0
+    if l2 < 1e-9:
+        l2 = 1e-9
+
+    def dev(px, py):
+        # отступ точки от ОТРЕЗКА нарисованной линии (не от прямой!)
+        t = ((px - x0) * ldx + (py - y0) * ldy) / l2
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        return math.hypot(x0 + t * ldx - px, y0 + t * ldy - py)
+
+    def alng(px, py):
+        # позиция точки ВДОЛЬ линии (в клетках от 1-й точки)
+        t = ((px - x0) * ldx + (py - y0) * ldy) / l2
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        return t * LLEN
+
+    def seg_mid(o, ix, iy):
+        return (ix + 0.5, iy) if o == 0 else (ix, iy + 0.5)
+
+    # коридор вдоль линии: шов идёт ТОЛЬКО по граням, проходящим не дальше
+    # CRACK_CORR клеток от нарисованной линии — трещина не уползает от неё
+    # (раньше A* мог обойти пустоту вдоль стенки далеко от линии)
+    CRACK_CORR = 2.0
+    sok = {}
+    for (o, ix, iy), bd in seg2bond.items():
+        mx_, my_ = seg_mid(o, ix, iy)
+        if dev(mx_, my_) <= CRACK_CORR:
+            sok[(o, ix, iy)] = bd
+    if not sok:
+        return 0
+
+    # углы коридора (детерминированный порядок)
+    corners = set()
+    for (o, ix, iy) in sok:
+        corners.add((ix, iy))
+        if o == 0:
+            corners.add((ix + 1, iy))
+        else:
+            corners.add((ix, iy + 1))
+    clist = sorted(corners)
+
+    # концы шва — углы, ближайшие к НАЧАЛУ и КОНЦУ линии ВДОЛЬ неё
+    # (раньше брался просто ближайший к клику угол — тот мог стоять далеко
+    # от линии, и весь шов уходил в сторону)
+    start = None
+    sbest = 1e18
+    goal = None
+    gbest = 1e18
+    for cxy in clist:
+        dv = dev(cxy[0], cxy[1])
+        al = alng(cxy[0], cxy[1])
+        s = al + 2.0 * dv
+        if s < sbest:
+            sbest = s
+            start = cxy
+        s = (LLEN - al) + 2.0 * dv
+        if s < gbest:
+            gbest = s
+            goal = cxy
+    if start is None or goal is None:
+        return 0
+
+    if start == goal and LLEN >= 0.75:
+        # цель не должна схлопываться в старт: берём самый дальний угол
+        # вдоль линии (иначе короткий шов превращался в одну грань «в точке»)
+        best2 = None
+        bs2 = -1e18
+        for cxy in clist:
+            if cxy == start:
+                continue
+            s = alng(cxy[0], cxy[1]) - 2.0 * dev(cxy[0], cxy[1])
+            if s > bs2:
+                bs2 = s
+                best2 = cxy
+        if best2 is not None:
+            goal = best2
+
+    def seg_cost(o, ix, iy):
+        mx_, my_ = seg_mid(o, ix, iy)
+        return 1.0 + 2.0 * dev(mx_, my_)
+
+    # соседние углы: из (cx, cy) — четыре возможных шага по целым граням
+    def neigh(cx, cy):
+        if (0, cx, cy) in sok:
+            yield (cx + 1, cy), sok[(0, cx, cy)], seg_cost(0, cx, cy)
+        if (0, cx - 1, cy) in sok:
+            yield (cx - 1, cy), sok[(0, cx - 1, cy)], seg_cost(0, cx - 1, cy)
+        if (1, cx, cy) in sok:
+            yield (cx, cy + 1), sok[(1, cx, cy)], seg_cost(1, cx, cy)
+        if (1, cx, cy - 1) in sok:
+            yield (cx, cy - 1), sok[(1, cx, cy - 1)], seg_cost(1, cx, cy - 1)
+
+    if start == goal:
+        # очень короткий клик: рвём одну ближайшую к ЛИНИИ грань
+        best_bd = -1
+        bestd = 1e18
+        mxl = (x0 + x1) * 0.5
+        myl = (y0 + y1) * 0.5
+        for (o, ix, iy), bidx in sok.items():
+            mx_, my_ = seg_mid(o, ix, iy)
+            d = dev(mx_, my_) + 0.25 * math.hypot(mx_ - mxl, my_ - myl)
+            if d < bestd:
+                bestd = d
+                best_bd = bidx
+        if best_bd < 0:
+            return 0
+        bondPath[0] = best_bd
+        pathX[0] = x0
+        pathY[0] = y0
+        pathN[None] = 1
+        bondN[None] = 1
+        b0 = broken[None]
+        crack_break_path()
+        return int(broken[None] - b0)
+
+    def astar(s, g):
+        # A* по углам коридора; эвристика — евклидово до угла цели
+        # (допустимо: шаг длиной 1 стоит >= 1)
+        dist = {s: 0.0}
+        prev = {s: None}
+        pseg = {s: -1}
+        open_h = []
+        heapq.heappush(open_h, (math.hypot(g[0] - s[0], g[1] - s[1]), 0.0, s))
+        found = False
+        # цель может оказаться за пустотой/разрывом: помним угол, дальше
+        # всех ушедший ВДОЛЬ линии к цели, и обрываемся на нём
+        gt = alng(g[0], g[1])
+        best_cur = s
+        best_sc = abs(alng(s[0], s[1]) - gt) + 2.0 * dev(s[0], s[1])
+        while open_h:
+            f, gc, cur = heapq.heappop(open_h)
+            if cur == g:
+                found = True
+                break
+            if gc > dist.get(cur, 1e18):
+                continue
+            sc = abs(alng(cur[0], cur[1]) - gt) + 2.0 * dev(cur[0], cur[1])
+            if sc < best_sc:
+                best_sc = sc
+                best_cur = cur
+            for nxt, bidx, cst in neigh(cur[0], cur[1]):
+                ng = gc + cst
+                if ng < dist.get(nxt, 1e18):
+                    dist[nxt] = ng
+                    prev[nxt] = cur
+                    pseg[nxt] = bidx
+                    h = math.hypot(g[0] - nxt[0], g[1] - nxt[1])
+                    heapq.heappush(open_h, (ng + h, ng, nxt))
+        end = g if found else best_cur
+        pts = []
+        bonds = []
+        cur = end
+        while cur is not None:
+            pts.append(cur)
+            bidx = pseg[cur]
+            if bidx >= 0:
+                bonds.append(bidx)
+            cur = prev[cur]
+        pts.reverse()
+        bonds.reverse()
+        return pts, bonds, found
+
+    pts, bonds, found = astar(start, goal)
+    if not found:
+        # пустота поперёк линии: рвём шов вдоль линии с ОБЕИХ сторон
+        # пустоты, а не обходим её далеко от линии
+        pts2, bonds2, _ = astar(goal, start)
+        seenb = set(bonds)
+        for bd in bonds2:
+            if bd not in seenb:
+                seenb.add(bd)
+                bonds.append(bd)
+        pts = pts + pts2
+    for i, bd in enumerate(bonds):
+        if i >= 1024:
+            break
+        bondPath[i] = bd
+    for i, (px, py) in enumerate(pts):
+        if i >= 1024:
+            break
+        pathX[i] = px
+        pathY[i] = py
+    pathN[None] = min(len(pts), 1024)
+    bondN[None] = min(len(bonds), 1024)
+    b0 = broken[None]
+    crack_break_path()
+    return int(broken[None] - b0)
 
 
 # ================================================================== selftest / GUI
@@ -1481,7 +1844,7 @@ def run_selftest(frames=120):
 
 
 def run_gui():
-    global model_angle
+    global model_angle, panel_visible
     apply_gravity(1.0)
     apply_rock(10.0, 4.0, 0.62)
     apply_water(12.0)
@@ -1505,6 +1868,7 @@ def run_gui():
     # как позволяет CPU (см. step_physics: следующий тик — после полного расчёта)
     window = ti.ui.Window("ГЕОМАССИВ/2D · DEM", (W, H), vsync=False)
     canvas = window.get_canvas()
+    reset_camera()   # стартовый кадр: вся область с запасом (барьер + нагрузка)
     gui = window.get_gui()
 
     generate(0, 0)
@@ -1514,6 +1878,7 @@ def run_gui():
     hud_t = 0.0
     last_mx = -1.0
     last_my = -1.0
+    crack_p0 = None            # первая точка трещины (клетки), None = ждём клика
     rain_until = -1.0          # simT (с), до которого идёт ливень; -1 = ливня нет
     flash_msg = "Nazhmite СТАРТ - simulyatsiya nachnetsya"
     flash_wall = 0.0           # реальное время (time.perf_counter) для всплывающих сообщений
@@ -1521,21 +1886,33 @@ def run_gui():
     last_hud_broken = 0
     cam_drag = False          # зажата средняя кнопка — таскаем камеру
     cam_prev = (0.0, 0.0)     # курсор прошлого кадра (для дельты драга)
-    seen_keys = set()         # диагностика неизвестных событий ввода (в консоль)
     ang_focus = 1             # какое поле угла принимает цифры: 0 = слои, 1 = модель (Tab)
     buf_sloi = ""             # буфер набора угла слоёв, град
     buf_model = ""            # буфер набора угла модели, град
     model_angle = 0.0         # текущий угол модели к горизонту, град (0 = как сгенерирована)
     legend_on = False         # легенда напряжений (кнопка под START)
+    hud_cache = None          # кэш снимка HUD (hudF.to_numpy() — синхронизация!)
+    hud_refresh = -1.0        # когда обновляли кэш (perf_counter)
+    freeze_t = -1.0           # диагностика зависших блоков (в консоль, раз в 3 с)
 
     while window.running:
         now = time.perf_counter()
         dt_real = min(0.05, now - last)
         last = now
-        # снимок HUD одним ядром + одним копированием на кадр (вместо двух
-        # десятков read'ов скаляров — каждый read был синхронизацией CPU<->GPU)
-        hud = hud_snapshot()
+        # снимок HUD одним ядром + одним копированием НЕ ЧАЩЕ 5 Гц (вместо
+        # каждого кадра): to_numpy() синхронизирует CPU<->GPU и сливает очередь
+        # ядер, из-за чего GPU регулярно «простаивает» между мелкими лаунчами.
+        # Слайдерам GUI свежесть 0.2 с не важна, время тика ведётся локально.
+        if hud_cache is None or now - hud_refresh > 0.2:
+            hud_cache = hud_snapshot()
+            hud_refresh = now
+        hud = hud_cache
         t_sim = hud[HUD_SIMT]     # внутреннее время симуляции (сек, дробное)
+        # раз в 3 с сканируем "зависшие" блоки и печатаем в консоль, КТО их держит
+        if now - freeze_t > 3.0:
+            freeze_t = now
+            if not paused:
+                frozen_report()
 
         try:
             # один проход по ВСЕМ событиям (колесо — не типа PRESS, отдельный
@@ -1598,7 +1975,11 @@ def run_gui():
                         flash_wall = now
                     continue
                 if k == ti.ui.ESCAPE:
-                    if buf_sloi or buf_model:
+                    if crack_p0 is not None:
+                        crack_p0 = None
+                        flash_msg = "Treshchina otmenena"
+                        flash_wall = now
+                    elif buf_sloi or buf_model:
                         buf_sloi = ""
                         buf_model = ""
                         flash_msg = "Vvod ugla otmenyon"
@@ -1612,10 +1993,7 @@ def run_gui():
                     else:
                         buf_model = buf_model[:-1]
                     continue
-                if k not in (ti.ui.SPACE, "c", ti.ui.LMB, ti.ui.RMB, ti.ui.MMB):
-                    if k not in seen_keys:
-                        seen_keys.add(k)
-                        print("input: neizvestnoye sobytiye key=%r delta=%r" % (k, getattr(e, "delta", None)))
+                if k not in (ti.ui.SPACE, "c", "p", "P", ti.ui.LMB, ti.ui.RMB, ti.ui.MMB):
                     continue
                 if not window.is_pressed(k):
                     continue
@@ -1625,14 +2003,35 @@ def run_gui():
                     reset_camera()
                     flash_msg = "Kamera sbroshena"
                     flash_wall = now
+                elif k in ("p", "P"):
+                    panel_visible = not panel_visible
+                    flash_msg = ("Panel skryta - klavisha P" if not panel_visible
+                                 else "Panel pokazana")
+                    flash_wall = now
                 elif k == ti.ui.LMB:
                     pos = window.get_cursor_pos()
                     mx, my = cursor_to_cells(pos)
-                    if pos[0] > 0.71:
+                    if panel_zone(pos):
+                        if tool == 1 and crack_p0 is not None:
+                            flash_msg = "Klik pod panel'yu - ne zachtyotsya (P - panel)"
+                            flash_wall = now
                         continue
                     if tool == 2:
                         flash_msg = place_source(mx, my)
                         flash_wall = now
+                    elif tool == 1:
+                        # трещина задаётся ДВУМЯ кликами (как в AutoCAD):
+                        # 1-й — точка, между кликами линия следует за курсором,
+                        # 2-й — A* находит путь примерно по линии и рвёт связи
+                        if crack_p0 is None:
+                            crack_p0 = (mx, my)
+                            flash_msg = "Treshchina: 1 tochka, kliknite 2 (Esc - otmena)"
+                            flash_wall = now
+                        else:
+                            nb = crack_line(crack_p0[0], crack_p0[1], mx, my)
+                            crack_p0 = None
+                            flash_msg = "Treshchina: razorvano svyazey %d" % nb
+                            flash_wall = now
                     else:
                         last_mx = mx
                         last_my = my
@@ -1644,9 +2043,9 @@ def run_gui():
                         flash_msg = "Istochnik ubran"
                         flash_wall = now
                 elif k == ti.ui.MMB:
-                    # зажатие СКМ — начать перетаскивание камеры
+                    # запасной старт драга по событию (основной - опрос VK_MBUTTON)
                     pos = window.get_cursor_pos()
-                    if pos[0] <= 0.71:
+                    if not panel_zone(pos):
                         cam_drag = True
                         cam_prev = pos
         except Exception:
@@ -1657,179 +2056,201 @@ def run_gui():
 
         if window.is_pressed(ti.ui.LMB):
             pos = window.get_cursor_pos()
-            if pos[0] <= 0.71:
+            if not panel_zone(pos):
                 mx, my = cursor_to_cells(pos)
-                if tool != 2 and last_mx >= 0:
+                if tool not in (1, 2) and last_mx >= 0:
                     last_mx, last_my = do_stroke(mx, my, last_mx, last_my, tool, brush)
-                if tool == 2 and last_mx < 0:
-                    pass
 
-        # перетаскивание камеры СКМ: двигаем за курсором
-        if cam_drag and window.is_pressed(ti.ui.MMB):
+        # перетаскивание камеры СКМ (колесо мыши): состояние кнопки опросом
+        # Win32 VK_MBUTTON - события ti.ui для MMB ненадёжны (как и для цифр),
+        # а window.is_pressed(MMB) не работает в GGUI. Дельта - по курсору.
+        mmb = (_user32.GetAsyncKeyState(0x04) & 0x8000) != 0 and _app_focused()
+        if mmb:
             pos = window.get_cursor_pos()
-            if pos[0] <= 0.71:
-                cam_write(_CAM[0] + pos[0] * W - cam_prev[0] * W,
-                          _CAM[1] - pos[1] * H - cam_prev[1] * H,
+            if not cam_drag:
+                if not panel_zone(pos):
+                    cam_drag = True
+                    cam_prev = pos
+            else:
+                cam_write(_CAM[0] + (pos[0] - cam_prev[0]) * W,
+                          _CAM[1] - (pos[1] - cam_prev[1]) * H,
                           _CAM[2])
                 cam_prev = pos
         else:
             cam_drag = False
 
+        # зум numpad +/-: якорь - курсор над канвой, иначе центр окна
+        zs = poll_zoom_keys(now)
+        if zs != 0:
+            pos = window.get_cursor_pos()
+            if panel_zone(pos):
+                pos = (0.5, 0.5)
+            zoom_at(pos, 1.18 if zs > 0 else 1.0 / 1.18)
+
         # ---- GUI
-        gui.begin("Upravlenie", 0.72, 0.02, 0.27, 0.96)
-        # кнопка старт/стоп: символы ▶/❚❚ не рисуются шрифтом, используем ASCII.
-        start_lbl = "> START" if paused else "|| СТОП"
-        if gui.button(start_lbl):
-            paused = not paused
-            flash_msg = "Симуляция запущена" if not paused else "Пауза"
-            flash_wall = now
-        # под START — переключатель легенды напряжений
-        if gui.button("Skryt legendu" if legend_on else "Pokazat legendu"):
-            legend_on = not legend_on
-        if legend_on:
-            pkT = hud[HUD_PEAKT] if hud[HUD_PEAKT] > 1e-4 else 1.0
-            pkC = hud[HUD_PEAKC] if hud[HUD_PEAKC] > 1e-4 else 1.0
-            gui.text("Legenda: 10 intervalov cveta, 0..pik napryazheniy")
-            gui.text("Krasnaya shkala - rastyazhenie: 0..%.1f MPa" % (hud[HUD_RP] * pkT))
-            gui.text("Sinyaya shkala - szhatie: 0..%.1f MPa" % (hud[HUD_RP] * hud[HUD_RCFACTOR] * pkC))
-        gui.text("Vremya simulyatsii: %.3f s" % t_sim)
-        gui.text("Scena: %s" % scene_names[mode])
-        gui.text("Naklon sloev: %g grad (g - vertikalno)" % tilt_deg)
-        gui.text("Poroda: E=%d GPa, Rt=%d MPa, Rc=%d MPa" % (E_GPa, int(hud[HUD_RP]), int(hud[HUD_RP] * hud[HUD_RCFACTOR])))
-        gui.text("Napor: %.2f MPa na porodu" % (RHO_W * G_PHYS * hud[HUD_HEAD] / 1e6))
-        gui.text("LKM - instrument * PKM - istochnik")
-        gui.text("SKM - peretaskivanie * Koleso - zum")
-        if gui.button("Poroda"):
-            tool = 0
-        if gui.button("Treshchina"):
-            tool = 1
-        if gui.button("Istochnik vody"):
-            tool = 2
-        if gui.button("Lastik"):
-            tool = 3
-        brush = gui.slider_int("Kist", brush, 1, 6)
-        E_new = gui.slider_int("Modul E, GPa", E_GPa, 1, 20)
-        rp_new = gui.slider_int("Rp (otriv) MPa", int(hud[HUD_RP]), 1, 15)
-        mu_new = gui.slider_int("Trenie mu %%", int(hud[HUD_MU] * 100), 20, 90)
-        if E_new != E_GPa or rp_new != int(hud[HUD_RP]) or mu_new != int(hud[HUD_MU] * 100):
-            E_GPa = E_new
-            apply_rock(E_GPa, float(rp_new), mu_new / 100.0, rho)
-        depth_new = gui.slider_int("Poroda nad skhemoy, m", int(hud[HUD_DEPTH]), 0, 3000)
-        if depth_new != int(hud[HUD_DEPTH]):
-            P[None].depth = depth_new
-        rho_new = gui.slider_int("Plotnost porody, kg/m3", int(rho), 1000, 3500)
-        if rho_new != rho:
-            rho = float(rho_new)
-            apply_rock(E_GPa, float(hud[HUD_RP]), hud[HUD_MU], rho)
-            apply_water(hud[HUD_HEAD])
-        k0_new = gui.slider_float("K0 bokovogo davleniya", hud[HUD_K0], 0.0, 2.0)
-        if k0_new != hud[HUD_K0]:
-            P[None].k0 = k0_new
-        fr_new = gui.slider_int("Zakrepl. ryadov", int(hud[HUD_FIXEDROWS]), 1, 4)
-        if fr_new != int(hud[HUD_FIXEDROWS]):
-            P[None].fixedRows = fr_new
-        bc_new = gui.slider_int("Limit razryvov/tik", int(hud[HUD_BRKCAP]), 1, 200)
-        if bc_new != int(hud[HUD_BRKCAP]):
-            P[None].brkCap = bc_new
-        dm_new = gui.slider_int("Tr. povrezhdeniya, tik", int(hud[HUD_DMGMAX]), 1, 60)
-        if dm_new != int(hud[HUD_DMGMAX]):
-            P[None].dmgMax = dm_new
-        pf_new = gui.slider_float("Skor. plast. techeniya, 1/s", hud[HUD_PLASTFLOW], 0.0, 1.0)
-        if pf_new != hud[HUD_PLASTFLOW]:
-            P[None].plastFlow = pf_new
-        walls = gui.checkbox("Bokovye stenki", hud[HUD_WALLS] == 1)
-        if walls != (hud[HUD_WALLS] == 1):
-            P[None].walls = 1 if walls else 0
-        weak_new = gui.checkbox("Oslablennye ploskosti", weak == 1)
-        if weak_new != weak:
-            weak = 1 if weak_new else 0
-            srcCount[None] = 0
-            generate(mode, weak, tilt_deg)
-            flash_msg = "Massiv %s: svyazey %d" % ("oslablen" if weak else "monolitny", count_intact())
-            flash_wall = now
-        # угол модели — поворот СОБРАННОЙ модели; угол слоёв — перегенерация
-        # с наклонными слоями; в обоих случаях сила тяжести остаётся вертикальной.
-        # угол — просто СТРОКИ набора числа (кнопка не нужна): цифры/знак/точка
-        # пишутся в активное поле сразу (символы читает poll_type_chars — события
-        # ti.ui цифры не приносят), Tab — переключить поле, Enter — применить,
-        # BackSpace — удалить, Esc — очистить буферы.
-        gui.text("Ugol modeli k horizontu, grad (seychas %g):" % model_angle)
-        gui.text("  [ %s ]%s   Tab - pole, Enter - primenit" % (buf_model, "_" if ang_focus == 1 else ""))
-        gui.text("Ugol sloev k horizontu, grad (seychas %g):" % tilt_deg)
-        gui.text("  [ %s ]%s   peresozdaet scenu, g vertikalno" % (buf_sloi, "_" if ang_focus == 0 else ""))
-        gv = gui.slider_int("Gravitatsiya x0.1g", int(hud[HUD_G] / G_PHYS * 10.0), 0, 20)
-        if gv != int(hud[HUD_G] / G_PHYS * 10.0):
-            apply_gravity(gv / 10.0)
-        if gui.button("Vyrabotka"):
-            if mode != 0:
-                mode = 0
-                srcCount[None] = 0
-                generate(mode, weak, tilt_deg)
-        if gui.button("Sklon"):
-            if mode != 1:
-                mode = 1
-                srcCount[None] = 0
-                generate(mode, weak, tilt_deg)
-        if gui.button("Krupnye bloki"):
-            if mode != 2:
-                mode = 2
-                srcCount[None] = 0
-                refillOff[None] = 0
-                generate(mode, weak, tilt_deg)
-                flash_msg = "Mozaika: blokov %d, max razmer %d" % (bcount[None], P[None].maxSize)
+        if panel_visible:
+            gui.begin("Upravlenie", 0.72, 0.02, 0.27, 0.96)
+            if gui.button("Skryt panel (klavisha P)"):
+                panel_visible = False
+            # кнопка старт/стоп: символы ▶/❚❚ не рисуются шрифтом, используем ASCII.
+            start_lbl = "> START" if paused else "|| СТОП"
+            if gui.button(start_lbl):
+                paused = not paused
+                flash_msg = "Симуляция запущена" if not paused else "Пауза"
                 flash_wall = now
-        if gui.button("Zapolnit massiv"):
-            srcCount[None] = 0
-            reset_all()
-            if abs(tilt_deg) > 0.5:
-                t = math.radians(tilt_deg)
-                gen_tilted(weak, math.cos(t), math.sin(t), 0)
-            else:
-                gen_solid()
-            flash_msg = "Massiv zapolnen: blokov %d" % bcount[None]
-            flash_wall = now
-        if gui.button("Peregenerirovat"):
-            srcCount[None] = 0
-            generate(mode, weak, tilt_deg)
-            flash_msg = "Massiv: svyazey %d" % count_intact()
-            flash_wall = now
-        if gui.button("Dozhd"):
-            rain_until = t_sim + 2.5
-            flash_msg = "Liven - voda ishchet treshchiny"
-            flash_wall = now
-        if gui.button("Ochistit porodu"):
-            clear_scene()
-            model_angle = 0.0
-            refillOff[None] = 1   # запретить досыпку обломков сверху
-            flash_msg = "Poroda ubrana"
-            flash_wall = now
-        show_bonds = 1 if gui.checkbox("Pokazyvat svyazi", show_bonds == 1) else 0
-        head_new = gui.slider_int("Napor H, m", int(hud[HUD_HEAD]), 1, 40)
-        if head_new != int(hud[HUD_HEAD]):
-            apply_water(float(head_new))
-        if gui.button("Slit vodu"):
-            pCount[None] = 0
-            filledFlag[None] = 0
-            flash_msg = "Voda slita"
-            flash_wall = now
-        if gui.button("Ubrat istochniki"):
-            srcCount[None] = 0
-            flash_msg = "Istochniki ubrany"
-            flash_wall = now
-        if gui.button("Pauza / Pusk (Space)"):
-            paused = not paused
-            if not paused:
-                flash_msg = "Симуляция запущена"
-            flash_wall = now
-        fp = hud[HUD_FILL]
-        gui.text("fps %.0f * blokov %d" % (fps, int(hud[HUD_BCOUNT])))
-        gui.text("chastits h2o %d%s * svyazey %d" % (int(hud[HUD_PCOUNT]), " (MAX)" if hud[HUD_PCOUNT] >= PMAX else "", int(hud[HUD_INTACT])))
-        gui.text("razryvov %d * zapolnenie %.0f%%" % (int(hud[HUD_BROKEN]), fp))
-        gui.text("Energiya: E=%.1e J (K=%.1e, P=%.1e)" % (hud[HUD_ETOT], hud[HUD_EKIN], hud[HUD_EPOT]))
-        gui.text("Centr tyazhesti: x=%.2f, y=%.2f m, massa=%.0f kg" % (hud[HUD_COMX], hud[HUD_COMY], hud[HUD_COMASS]))
-        if flash_msg and (now - flash_wall < 2.0):
-            gui.text(flash_msg)
-        gui.end()
+            # под START — переключатель легенды напряжений
+            if gui.button("Skryt legendu" if legend_on else "Pokazat legendu"):
+                legend_on = not legend_on
+            if legend_on:
+                pkT = hud[HUD_PEAKT] if hud[HUD_PEAKT] > 1e-4 else 1.0
+                pkC = hud[HUD_PEAKC] if hud[HUD_PEAKC] > 1e-4 else 1.0
+                gui.text("Legenda: 10 intervalov cveta, 0..pik napryazheniy")
+                gui.text("Krasnaya shkala - rastyazhenie: 0..%.1f MPa" % (hud[HUD_RP] * pkT))
+                gui.text("Sinyaya shkala - szhatie: 0..%.1f MPa" % (hud[HUD_RP] * hud[HUD_RCFACTOR] * pkC))
+            gui.text("Vremya simulyatsii: %.3f s" % t_sim)
+            gui.text("Scena: %s" % scene_names[mode])
+            gui.text("Naklon sloev: %g grad (g - vertikalno)" % tilt_deg)
+            gui.text("Poroda: E=%d GPa, Rt=%d MPa, Rc=%d MPa" % (E_GPa, int(hud[HUD_RP]), int(hud[HUD_RP] * hud[HUD_RCFACTOR])))
+            gui.text("Napor: %.2f MPa na porodu" % (RHO_W * G_PHYS * hud[HUD_HEAD] / 1e6))
+            gui.text("LKM - instrument * PKM - istochnik")
+            gui.text("SKM - peretaskivanie * Numpad +/- zum * P - panel")
+            gui.text("Treshchina: 2 klika (liniya), Esc - otmena")
+            if gui.button("Poroda"):
+                tool = 0
+                crack_p0 = None
+            if gui.button("Treshchina"):
+                tool = 1
+                crack_p0 = None
+            if gui.button("Istochnik vody"):
+                tool = 2
+                crack_p0 = None
+            if gui.button("Lastik"):
+                tool = 3
+                crack_p0 = None
+            brush = gui.slider_int("Kist", brush, 1, 6)
+            E_new = gui.slider_int("Modul E, GPa", E_GPa, 1, 20)
+            rp_new = gui.slider_int("Rp (otriv) MPa", int(hud[HUD_RP]), 1, 15)
+            mu_new = gui.slider_int("Trenie mu %%", int(hud[HUD_MU] * 100), 20, 90)
+            if E_new != E_GPa or rp_new != int(hud[HUD_RP]) or mu_new != int(hud[HUD_MU] * 100):
+                E_GPa = E_new
+                apply_rock(E_GPa, float(rp_new), mu_new / 100.0, rho)
+            depth_new = gui.slider_int("Poroda nad skhemoy, m", int(hud[HUD_DEPTH]), 0, 3000)
+            if depth_new != int(hud[HUD_DEPTH]):
+                P[None].depth = depth_new
+            rho_new = gui.slider_int("Plotnost porody, kg/m3", int(rho), 1000, 3500)
+            if rho_new != rho:
+                rho = float(rho_new)
+                apply_rock(E_GPa, float(hud[HUD_RP]), hud[HUD_MU], rho)
+                apply_water(hud[HUD_HEAD])
+            k0_new = gui.slider_float("K0 bokovogo davleniya", hud[HUD_K0], 0.0, 2.0)
+            if k0_new != hud[HUD_K0]:
+                P[None].k0 = k0_new
+            fr_new = gui.slider_int("Zakrepl. ryadov", int(hud[HUD_FIXEDROWS]), 1, 4)
+            if fr_new != int(hud[HUD_FIXEDROWS]):
+                P[None].fixedRows = fr_new
+            bc_new = gui.slider_int("Limit razryvov/tik", int(hud[HUD_BRKCAP]), 1, 200)
+            if bc_new != int(hud[HUD_BRKCAP]):
+                P[None].brkCap = bc_new
+            dm_new = gui.slider_int("Tr. povrezhdeniya, tik", int(hud[HUD_DMGMAX]), 1, 60)
+            if dm_new != int(hud[HUD_DMGMAX]):
+                P[None].dmgMax = dm_new
+            pf_new = gui.slider_float("Skor. plast. techeniya, 1/s", hud[HUD_PLASTFLOW], 0.0, 1.0)
+            if pf_new != hud[HUD_PLASTFLOW]:
+                P[None].plastFlow = pf_new
+            walls = gui.checkbox("Bokovye stenki", hud[HUD_WALLS] == 1)
+            if walls != (hud[HUD_WALLS] == 1):
+                P[None].walls = 1 if walls else 0
+            weak_new = gui.checkbox("Oslablennye ploskosti", weak == 1)
+            if weak_new != weak:
+                weak = 1 if weak_new else 0
+                srcCount[None] = 0
+                generate(mode, weak, tilt_deg)
+                flash_msg = "Massiv %s: svyazey %d" % ("oslablen" if weak else "monolitny", count_intact())
+                flash_wall = now
+            # угол модели — поворот СОБРАННОЙ модели; угол слоёв — перегенерация
+            # с наклонными слоями; в обоих случаях сила тяжести остаётся вертикальной.
+            # угол — просто СТРОКИ набора числа (кнопка не нужна): цифры/знак/точка
+            # пишутся в активное поле сразу (символы читает poll_type_chars — события
+            # ti.ui цифры не приносят), Tab — переключить поле, Enter — применить,
+            # BackSpace — удалить, Esc — очистить буферы.
+            gui.text("Ugol modeli k horizontu, grad (seychas %g):" % model_angle)
+            gui.text("  [ %s ]%s   Tab - pole, Enter - primenit" % (buf_model, "_" if ang_focus == 1 else ""))
+            gui.text("Ugol sloev k horizontu, grad (seychas %g):" % tilt_deg)
+            gui.text("  [ %s ]%s   peresozdaet scenu, g vertikalno" % (buf_sloi, "_" if ang_focus == 0 else ""))
+            gv = gui.slider_int("Gravitatsiya x0.1g", int(hud[HUD_G] / G_PHYS * 10.0), 0, 20)
+            if gv != int(hud[HUD_G] / G_PHYS * 10.0):
+                apply_gravity(gv / 10.0)
+            if gui.button("Vyrabotka"):
+                if mode != 0:
+                    mode = 0
+                    srcCount[None] = 0
+                    generate(mode, weak, tilt_deg)
+            if gui.button("Sklon"):
+                if mode != 1:
+                    mode = 1
+                    srcCount[None] = 0
+                    generate(mode, weak, tilt_deg)
+            if gui.button("Krupnye bloki"):
+                if mode != 2:
+                    mode = 2
+                    srcCount[None] = 0
+                    refillOff[None] = 0
+                    generate(mode, weak, tilt_deg)
+                    flash_msg = "Mozaika: blokov %d, max razmer %d" % (bcount[None], P[None].maxSize)
+                    flash_wall = now
+            if gui.button("Zapolnit massiv"):
+                srcCount[None] = 0
+                reset_all()
+                if abs(tilt_deg) > 0.5:
+                    t = math.radians(tilt_deg)
+                    gen_tilted(weak, math.cos(t), math.sin(t), 0)
+                else:
+                    gen_solid()
+                flash_msg = "Massiv zapolnen: blokov %d" % bcount[None]
+                flash_wall = now
+            if gui.button("Peregenerirovat"):
+                srcCount[None] = 0
+                generate(mode, weak, tilt_deg)
+                flash_msg = "Massiv: svyazey %d" % count_intact()
+                flash_wall = now
+            if gui.button("Dozhd"):
+                rain_until = t_sim + 2.5
+                flash_msg = "Liven - voda ishchet treshchiny"
+                flash_wall = now
+            if gui.button("Ochistit porodu"):
+                clear_scene()
+                model_angle = 0.0
+                refillOff[None] = 1   # запретить досыпку обломков сверху
+                flash_msg = "Poroda ubrana"
+                flash_wall = now
+            show_bonds = 1 if gui.checkbox("Pokazyvat svyazi", show_bonds == 1) else 0
+            head_new = gui.slider_int("Napor H, m", int(hud[HUD_HEAD]), 1, 40)
+            if head_new != int(hud[HUD_HEAD]):
+                apply_water(float(head_new))
+            if gui.button("Slit vodu"):
+                pCount[None] = 0
+                filledFlag[None] = 0
+                flash_msg = "Voda slita"
+                flash_wall = now
+            if gui.button("Ubrat istochniki"):
+                srcCount[None] = 0
+                flash_msg = "Istochniki ubrany"
+                flash_wall = now
+            if gui.button("Pauza / Pusk (Space)"):
+                paused = not paused
+                if not paused:
+                    flash_msg = "Симуляция запущена"
+                flash_wall = now
+            fp = hud[HUD_FILL]
+            gui.text("fps %.0f * blokov %d" % (fps, int(hud[HUD_BCOUNT])))
+            gui.text("chastits h2o %d%s * svyazey %d" % (int(hud[HUD_PCOUNT]), " (MAX)" if hud[HUD_PCOUNT] >= PMAX else "", int(hud[HUD_INTACT])))
+            gui.text("razryvov %d * zapolnenie %.0f%%" % (int(hud[HUD_BROKEN]), fp))
+            gui.text("Energiya: E=%.1e J (K=%.1e, P=%.1e)" % (hud[HUD_ETOT], hud[HUD_EKIN], hud[HUD_EPOT]))
+            gui.text("Centr tyazhesti: x=%.2f, y=%.2f m, massa=%.0f kg" % (hud[HUD_COMX], hud[HUD_COMY], hud[HUD_COMASS]))
+            # flash-сообщения — строкой внутри панели (без оверлея поверх канвы)
+            if flash_msg and (now - flash_wall < 2.0):
+                gui.text(flash_msg)
+            gui.end()
 
         # ---- симуляция
         # Один тик за итерацию окна (без vsync цикл крутится на полной скорости
@@ -1871,9 +2292,12 @@ def run_gui():
         render_sources(t_sim)
 
         pos = window.get_cursor_pos()
-        if pos[0] <= 0.71:
+        if not panel_zone(pos):
             mx, my = cursor_to_cells(pos)
             render_mouse(mx, my, brush, 1 if tool == 2 else 0)
+            if tool == 1 and crack_p0 is not None:
+                # резиновая линия трещины от 1-й точки до курсора
+                render_rubber(crack_p0[0], crack_p0[1], mx, my)
         else:
             render_mouse(-999.0, 0.0, brush, 0)
 
